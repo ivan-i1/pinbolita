@@ -1,17 +1,24 @@
 import {
   FRAME_MS,
-  applyRest,
   capSpeed,
   frameScale,
   impactGain,
   impulseAwayFrom,
   frictionRetention,
-  isShake,
   nextHue,
   swipeLaunch,
   pickVariant,
-  stepGravity,
-  tiltPitch,
+  stepBall,
+  catchFraction,
+  laneOf,
+  laneAfterCatch,
+  laneAfterLaunch,
+  laneTick,
+  laneLight,
+  bandOf,
+  upwardLaunch,
+  hasFallenOut,
+  type Lane,
   type Rng,
 } from '../game/physics';
 
@@ -122,48 +129,6 @@ describe('capSpeed', () => {
   });
 });
 
-describe('applyRest', () => {
-  it('stops a crawling ball dead when the phone is flat', () => {
-    expect(applyRest(0.01, -0.02, 0.001, 0.08, 0.045)).toEqual({ x: 0, y: 0 });
-  });
-
-  it('leaves a crawling ball moving if the phone is tilted', () => {
-    expect(applyRest(0.01, -0.02, 0.9, 0.08, 0.045)).toEqual({ x: 0.01, y: -0.02 });
-  });
-
-  it('never stops a ball that is actually moving', () => {
-    expect(applyRest(5, 5, 0.001, 0.08, 0.045)).toEqual({ x: 5, y: 5 });
-  });
-
-  it('uses a strict threshold — exactly at the epsilon it keeps moving', () => {
-    const v = applyRest(0.08, 0, 0, 0.08, 0.045);
-    expect(v).toEqual({ x: 0.08, y: 0 });
-  });
-});
-
-describe('stepGravity', () => {
-  it('snaps straight to the sample when lerp is 1', () => {
-    expect(stepGravity(0, 0, 0.5, -1, 1)).toEqual({ x: 0.5, y: -1 });
-  });
-
-  it('ignores the sample entirely when lerp is 0', () => {
-    expect(stepGravity(0.3, 0.4, 9, 9, 0)).toEqual({ x: 0.3, y: 0.4 });
-  });
-
-  it('moves halfway when lerp is 0.5', () => {
-    const g = stepGravity(0, 0, 1, -1, 0.5);
-    expect(g.x).toBeCloseTo(0.5, 6);
-    expect(g.y).toBeCloseTo(-0.5, 6);
-  });
-
-  it('converges on a steady orientation after repeated samples', () => {
-    let g = { x: 0, y: 0 };
-    for (let i = 0; i < 200; i++) g = stepGravity(g.x, g.y, 0, -1, 0.08);
-    expect(g.y).toBeCloseTo(-1, 3);
-    expect(g.x).toBeCloseTo(0, 3);
-  });
-});
-
 describe('impactGain', () => {
   it('floors a feather-light graze at the minimum gain', () => {
     expect(impactGain(0, 14, 0.25)).toBeCloseTo(0.25, 6);
@@ -218,74 +183,6 @@ describe('pickVariant', () => {
 // by GRAVITY_LERP per frame, so the residual stays large for the whole rotation. These
 // pin the extra test that tells the two apart — rotating the phone keeps total
 // acceleration at ~1g, while actually moving it does not.
-describe('isShake', () => {
-  const RES = 0.15;
-  const MAG = 0.12;
-
-  it('rejects a tilt: big residual, but magnitude still 1g', () => {
-    expect(isShake(0.4, 0.3, 1.0, RES, MAG)).toBe(false);
-  });
-
-  it('accepts a shake: big residual and magnitude well off 1g', () => {
-    expect(isShake(0.4, 0.3, 1.5, RES, MAG)).toBe(true);
-  });
-
-  it('rejects a shake that is too gentle, however far off 1g', () => {
-    expect(isShake(0.02, 0.01, 1.9, RES, MAG)).toBe(false);
-  });
-
-  it('accepts acceleration below 1g too — free-fall is movement', () => {
-    expect(isShake(0.4, 0.3, 0.4, RES, MAG)).toBe(true);
-  });
-
-  it('is strict at both thresholds — exactly at them is not a shake', () => {
-    expect(isShake(RES, 0, 1 + MAG, RES, MAG)).toBe(false);
-  });
-
-  it('holds across a whole simulated tilt sweep', () => {
-    // Rotate from flat to upright; gravity lags, so residuals are large throughout,
-    // but the magnitude never leaves 1g. Not one sample may read as a shake.
-    let gx = 0;
-    for (let deg = 0; deg <= 90; deg += 2) {
-      const rad = (deg * Math.PI) / 180;
-      const x = Math.sin(rad);
-      gx += (x - gx) * 0.08; // the same lerp the app uses
-      expect(isShake(x - gx, 0, 1.0, RES, MAG)).toBe(false);
-    }
-  });
-});
-
-describe('tiltPitch', () => {
-  const RISE = 0.8;
-
-  it('is the base pitch when the phone is flat', () => {
-    expect(tiltPitch(0, 1, 0.6, RISE)).toBeCloseTo(1);
-  });
-
-  it('rises with tilt', () => {
-    expect(tiltPitch(1, 1, 1, RISE)).toBeCloseTo(1 + RISE);
-  });
-
-  it('an amount of 0 disables the effect entirely', () => {
-    expect(tiltPitch(1, 1, 0, RISE)).toBeCloseTo(1);
-  });
-
-  it('scales with the base pitch', () => {
-    expect(tiltPitch(0, 1.5, 0.6, RISE)).toBeCloseTo(1.5);
-  });
-
-  it('is monotonic in tilt', () => {
-    const a = tiltPitch(0.2, 1, 0.6, RISE);
-    const b = tiltPitch(0.7, 1, 0.6, RISE);
-    expect(b).toBeGreaterThan(a);
-  });
-
-  it('clamps tilt outside 0..1 rather than running away', () => {
-    expect(tiltPitch(4, 1, 1, RISE)).toBeCloseTo(1 + RISE);
-    expect(tiltPitch(-2, 1, 1, RISE)).toBeCloseTo(1);
-  });
-});
-
 describe('nextHue', () => {
   const seq = (values: number[]): Rng => {
     let i = 0;
@@ -377,5 +274,184 @@ describe('swipeLaunch', () => {
   it('preserves direction after the cap is applied', () => {
     const v = swipeLaunch(3000, 4000, MIN, GAIN, 40)!;
     expect(v.y / v.x).toBeCloseTo(4 / 3);
+  });
+});
+
+describe('stepBall', () => {
+  const at = (x: number, y: number, vx = 0, vy = 0) => ({ x, y, vx, vy });
+
+  it('starts a ball at rest falling under a weak pull, even at 120Hz', () => {
+    // The engine's rest clamp zeroed any speed under 0.08 px/frame, so a pull this weak
+    // left a respawned ball hanging in mid-air forever. There is no clamp any more.
+    const next = stepBall(at(100, 100), 0.05, 0.5, 0.995, 40);
+    expect(next.vy).toBeGreaterThan(0);
+    expect(next.y).toBeGreaterThan(100);
+  });
+
+  it('keeps accelerating a ball under a constant pull', () => {
+    let ball = at(0, 0);
+    const speeds: number[] = [];
+    for (let i = 0; i < 5; i++) {
+      ball = stepBall(ball, 0.2, 1, 0.995, 40);
+      speeds.push(ball.vy);
+    }
+    for (let i = 1; i < speeds.length; i++) expect(speeds[i]).toBeGreaterThan(speeds[i - 1]);
+  });
+
+  it('pulls only downward — sideways velocity just decays', () => {
+    const next = stepBall(at(0, 0, 10, 0), 0.2, 1, 0.9, 40);
+    expect(next.vx).toBeCloseTo(9, 5);
+    expect(next.vy).toBeGreaterThan(0);
+  });
+
+  it('never exceeds the speed cap', () => {
+    const next = stepBall(at(0, 0, 0, 39.9), 5, 1, 1, 40);
+    expect(Math.hypot(next.vx, next.vy)).toBeCloseTo(40, 5);
+  });
+
+  it('covers the same ground per second at 60Hz and 120Hz', () => {
+    let a = at(0, 0, 0, 10);
+    let b = at(0, 0, 0, 10);
+    for (let i = 0; i < 60; i++) a = stepBall(a, 0, 1, 1, 40);
+    for (let i = 0; i < 120; i++) b = stepBall(b, 0, 0.5, 1, 40);
+    expect(b.y).toBeCloseTo(a.y, 5);
+  });
+});
+
+describe('catchFraction', () => {
+  const r = 10;
+
+  it('is 0 while the ball is wholly above the band edge', () => {
+    expect(catchFraction(100 - r - 1, 100, r)).toBe(0);
+  });
+
+  it('is 1 once the ball is wholly inside the band', () => {
+    expect(catchFraction(100 + r + 1, 100, r)).toBe(1);
+  });
+
+  it('is exactly half when the centre sits on the edge', () => {
+    expect(catchFraction(100, 100, r)).toBeCloseTo(0.5, 10);
+  });
+
+  it('reaches 35% with the centre still 0.238r above the edge', () => {
+    // Solved numerically in the design loop: the leading edge has gone 0.762r into the
+    // band while the centre is still outside it.
+    expect(catchFraction(100 - 0.2379 * r, 100, r)).toBeCloseTo(0.35, 3);
+  });
+
+  it('grows as the ball sinks into the band', () => {
+    let last = -1;
+    for (let y = 85; y <= 115; y += 1) {
+      const f = catchFraction(y, 100, r);
+      expect(f).toBeGreaterThanOrEqual(last);
+      last = f;
+    }
+  });
+});
+
+describe('laneOf', () => {
+  it('puts every x in lane 0 when there is one lane', () => {
+    expect(laneOf(0, 400, 1)).toBe(0);
+    expect(laneOf(399, 400, 1)).toBe(0);
+  });
+
+  it('splits the width into equal lanes, left to right', () => {
+    expect(laneOf(50, 400, 4)).toBe(0);
+    expect(laneOf(150, 400, 4)).toBe(1);
+    expect(laneOf(250, 400, 4)).toBe(2);
+    expect(laneOf(350, 400, 4)).toBe(3);
+  });
+
+  it('assigns a centre exactly on a boundary to exactly one lane', () => {
+    expect(laneOf(200, 400, 2)).toBe(1);
+  });
+
+  it('clamps positions outside the table to the edge lanes', () => {
+    expect(laneOf(-5, 400, 2)).toBe(0);
+    expect(laneOf(400, 400, 2)).toBe(1);
+  });
+});
+
+describe('lane state', () => {
+  const ready: Lane = { phase: 'ready', readyAt: 0 };
+
+  it('a ready lane catches the ball', () => {
+    expect(laneAfterCatch(ready).phase).toBe('holding');
+  });
+
+  it('a lane on cooldown does not catch — the ball falls through', () => {
+    const cooling: Lane = { phase: 'cooldown', readyAt: 5000 };
+    expect(laneAfterCatch(cooling)).toEqual(cooling);
+  });
+
+  it('launching from a holding lane starts its own cooldown', () => {
+    const next = laneAfterLaunch({ phase: 'holding', readyAt: 0 }, 1000, 1500);
+    expect(next).toEqual({ phase: 'cooldown', readyAt: 2500 });
+  });
+
+  it('a lane that is not holding cannot launch', () => {
+    expect(laneAfterLaunch(ready, 1000, 1500)).toEqual(ready);
+  });
+
+  it('comes back ready once the cooldown has elapsed, not before', () => {
+    const cooling: Lane = { phase: 'cooldown', readyAt: 2500 };
+    expect(laneTick(cooling, 2499).phase).toBe('cooldown');
+    expect(laneTick(cooling, 2500).phase).toBe('ready');
+  });
+
+  it('lights up while holding, darkens on cooldown, and is gray on standby', () => {
+    expect(laneLight({ phase: 'holding', readyAt: 0 })).toBe('lit');
+    expect(laneLight({ phase: 'cooldown', readyAt: 9 })).toBe('dark');
+    expect(laneLight(ready)).toBe('gray');
+  });
+});
+
+describe('bandOf', () => {
+  // 1000 tall: top band 0..150, bottom band 780..1000, dead strip below 952.
+  const band = (y: number) => bandOf(y, 1000, 0.15, 0.22, 48);
+
+  it('classifies the three horizontal bands', () => {
+    expect(band(10)).toBe('top');
+    expect(band(500)).toBe('middle');
+    expect(band(900)).toBe('bottom');
+  });
+
+  it("refuses a touch starting in Android's bottom gesture strip", () => {
+    expect(band(960)).toBe('none');
+  });
+
+  it('places the band edges exactly on the fractions', () => {
+    expect(band(149.9)).toBe('top');
+    expect(band(150)).toBe('middle');
+    expect(band(780)).toBe('middle');
+    expect(band(780.1)).toBe('bottom');
+  });
+});
+
+describe('upwardLaunch', () => {
+  it('launches an upward swipe exactly like swipeLaunch', () => {
+    expect(upwardLaunch(10, -100, 20, 0.09, 40)).toEqual(swipeLaunch(10, -100, 20, 0.09, 40));
+  });
+
+  it('ignores a downward swipe — it would throw the ball into the drain', () => {
+    expect(upwardLaunch(0, 100, 20, 0.09, 40)).toBeNull();
+  });
+
+  it('ignores a purely sideways swipe', () => {
+    expect(upwardLaunch(100, 0, 20, 0.09, 40)).toBeNull();
+  });
+
+  it('still treats a short drag as no launch', () => {
+    expect(upwardLaunch(0, -10, 20, 0.09, 40)).toBeNull();
+  });
+});
+
+describe('hasFallenOut', () => {
+  it('is false while any part of the ball is still on the table', () => {
+    expect(hasFallenOut(1005, 10, 1000)).toBe(false);
+  });
+
+  it('is true once the whole ball has passed the bottom edge', () => {
+    expect(hasFallenOut(1010.1, 10, 1000)).toBe(true);
   });
 });

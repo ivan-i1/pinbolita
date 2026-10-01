@@ -1,8 +1,8 @@
 /**
- * Pure game maths — no React, no sensors, no audio, no Dimensions.
+ * Pure game maths — no React, no audio, no Dimensions.
  *
- * Everything the frame loop needs to *decide* lives here so it can be unit tested.
- * Everything that needs a device (playing a sound, reading the accelerometer,
+ * Everything the frame loop and the touch router need to *decide* lives here so it can
+ * be unit tested. Everything that needs a device (playing a sound, reading touches,
  * rendering) stays in App.tsx. Keep this file import-free.
  */
 
@@ -71,42 +71,6 @@ export function capSpeed(vx: number, vy: number, max: number): Vec {
   return { x: vx * scale, y: vy * scale };
 }
 
-/**
- * Snaps a barely-moving ball to a genuine stop.
- *
- * Friction alone decays velocity asymptotically, so the ball creeps at sub-pixel speed
- * forever. Only zero it when the phone is also flat — otherwise a tilted phone would
- * keep killing the very motion it is trying to create.
- */
-export function applyRest(
-  vx: number,
-  vy: number,
-  tiltMagnitude: number,
-  restEpsilon: number,
-  tiltDeadzone: number,
-): Vec {
-  const speed = Math.hypot(vx, vy);
-  if (speed < restEpsilon && tiltMagnitude < tiltDeadzone) return { x: 0, y: 0 };
-  return { x: vx, y: vy };
-}
-
-/**
- * One step of the low-pass gravity estimate.
- *
- * Accelerometer samples mix gravity (low frequency, follows orientation) with real
- * shaking (high frequency). This EMA tracks the gravity part; subtracting it leaves the
- * linear acceleration that actually represents a shake.
- */
-export function stepGravity(
-  gx: number,
-  gy: number,
-  sampleX: number,
-  sampleY: number,
-  lerp: number,
-): Vec {
-  return { x: gx + (sampleX - gx) * lerp, y: gy + (sampleY - gy) * lerp };
-}
-
 /** Maps impact speed to playback volume, so a slam is louder than a graze. */
 export function impactGain(speed: number, loudSpeed: number, minGain: number): number {
   if (loudSpeed <= 0) return 1;
@@ -131,52 +95,6 @@ export function pickVariant(count: number, last: number, rng: Rng): number {
   let index = Math.min(Math.floor(rng() * pool), pool - 1);
   if (index >= last) index += 1;
   return index;
-}
-
-/**
- * Tell a shake apart from a tilt.
- *
- * The residual alone cannot do this. `stepGravity` follows the raw sample by only
- * GRAVITY_LERP per frame, so rotating the phone leaves a large residual for the whole
- * sweep — which read as a sustained shake, firing the push sound on a ~110ms cadence
- * and shoving the ball with impulses the player never asked for.
- *
- * The extra fact that separates them is total acceleration. Rotating a phone only
- * turns the 1g gravity vector, so its magnitude stays ~1; actually moving the phone
- * adds to or subtracts from it. Requiring both a real residual *and* a departure from
- * 1g keeps shake responsive while rejecting tilt outright.
- *
- * Both comparisons are strict, so a value sitting exactly on a threshold is not a shake.
- */
-export function isShake(
-  linearX: number,
-  linearY: number,
-  accelMagnitude: number,
-  residualThreshold: number,
-  magnitudeThreshold: number,
-): boolean {
-  if (Math.hypot(linearX, linearY) <= residualThreshold) return false;
-  return Math.abs(accelMagnitude - 1) > magnitudeThreshold;
-}
-
-/**
- * Playback rate for a sound, given how far the phone is tilted.
- *
- * `tiltMagnitude` is hypot(tilt.x, tilt.y): 0 lying flat, 1 stood on edge. It is
- * clamped because the accelerometer overshoots past 1g when the phone is moved as
- * well as turned, and an unclamped rate runs the pitch away.
- *
- * `amount` is the user's slider; at 0 the effect is off and the base pitch is returned
- * untouched, which is what makes the control feel like a real disable.
- */
-export function tiltPitch(
-  tiltMagnitude: number,
-  basePitch: number,
-  amount: number,
-  maxRise: number,
-): number {
-  const t = Math.max(0, Math.min(1, tiltMagnitude));
-  return basePitch * (1 + t * amount * maxRise);
 }
 
 /**
@@ -232,4 +150,132 @@ export function swipeLaunch(
   const speed = Math.min(distance * gain, maxSpeed);
   // Scale the raw delta onto the target speed, so direction survives the cap intact.
   return { x: (dx / distance) * speed, y: (dy / distance) * speed };
+}
+
+/**
+ * The launch a lane gives a caught ball: a flick, but only an upward one.
+ *
+ * A downward or sideways swipe from the bottom lanes would throw the ball straight into
+ * the drain, which is never what the player meant. Screen y grows down, so "upward" is
+ * a negative dy.
+ */
+export function upwardLaunch(
+  dx: number,
+  dy: number,
+  minDistance: number,
+  gain: number,
+  maxSpeed: number,
+): Vec | null {
+  if (dy >= 0) return null;
+  return swipeLaunch(dx, dy, minDistance, gain, maxSpeed);
+}
+
+export type Ball = { x: number; y: number; vx: number; vy: number };
+
+/**
+ * One frame of free flight: constant downward pull, friction, speed cap, integration.
+ *
+ * There is deliberately no rest clamp. The engine used to zero any speed below 0.08
+ * px/frame when the phone was flat, which under a weak constant pull left a ball at rest
+ * hanging in mid-air forever — and at 120 Hz the threshold effectively doubled. With a
+ * pull that never switches off, a ball never legitimately rests in open space.
+ *
+ * `pull` is in px/frame² at the 60 Hz baseline and, like every force, is scaled by dtf.
+ */
+export function stepBall(
+  ball: Ball,
+  pull: number,
+  dtf: number,
+  retention: number,
+  maxSpeed: number,
+): Ball {
+  const damping = Math.pow(retention, dtf);
+  const capped = capSpeed(ball.vx * damping, (ball.vy + pull * dtf) * damping, maxSpeed);
+  return {
+    x: ball.x + capped.x * dtf,
+    y: ball.y + capped.y * dtf,
+    vx: capped.x,
+    vy: capped.y,
+  };
+}
+
+/**
+ * Fraction of the ball's AREA that lies below a horizontal edge.
+ *
+ * This is the lanes' 35% rule, computed exactly rather than by heuristic: it is the area
+ * of a circular segment, one acos and one sqrt per frame. At 35% the centre is still
+ * 0.238·r above the edge.
+ */
+export function catchFraction(centreY: number, edgeY: number, radius: number): number {
+  const u = (edgeY - centreY) / radius; // centre's height above the edge, in radii
+  if (u >= 1) return 0;
+  if (u <= -1) return 1;
+  return (Math.acos(u) - u * Math.sqrt(1 - u * u)) / Math.PI;
+}
+
+/**
+ * Which lane a ball belongs to: the one containing its centre.
+ *
+ * Membership by centre is a partition — lanes never overlap, so a ball straddling a
+ * boundary still belongs to exactly one of them and no tie-break is needed.
+ */
+export function laneOf(x: number, width: number, laneCount: number): number {
+  if (laneCount <= 1) return 0;
+  return clamp(Math.floor((x / width) * laneCount), 0, laneCount - 1);
+}
+
+export type LanePhase = 'ready' | 'holding' | 'cooldown';
+/** `readyAt` is only meaningful while cooling down: the clock time it becomes ready. */
+export type Lane = { phase: LanePhase; readyAt: number };
+
+/** A ready lane catches the ball; a lane on cooldown lets it fall through to the drain. */
+export function laneAfterCatch(lane: Lane): Lane {
+  return lane.phase === 'ready' ? { phase: 'holding', readyAt: 0 } : lane;
+}
+
+/** Launching releases the ball and starts this lane's own cooldown. */
+export function laneAfterLaunch(lane: Lane, now: number, cooldownMs: number): Lane {
+  if (lane.phase !== 'holding') return lane;
+  return { phase: 'cooldown', readyAt: now + cooldownMs };
+}
+
+export function laneTick(lane: Lane, now: number): Lane {
+  if (lane.phase === 'cooldown' && now >= lane.readyAt) return { phase: 'ready', readyAt: 0 };
+  return lane;
+}
+
+export type LaneLight = 'lit' | 'dark' | 'gray';
+
+/** Lit when a swipe will launch, dark while cooling down, gray on standby. */
+export function laneLight(lane: Lane): LaneLight {
+  if (lane.phase === 'holding') return 'lit';
+  if (lane.phase === 'cooldown') return 'dark';
+  return 'gray';
+}
+
+export type Band = 'top' | 'middle' | 'bottom' | 'none';
+
+/**
+ * Which horizontal band a touch STARTED in.
+ *
+ * The bottom `bottomGuard` px are Android's home-gesture strip, which the system claims
+ * and no app can exclude; a touch starting there is refused rather than half-handled.
+ * Edges are half-open so every y belongs to exactly one band.
+ */
+export function bandOf(
+  y: number,
+  height: number,
+  topFraction: number,
+  bottomFraction: number,
+  bottomGuard: number,
+): Band {
+  if (y < height * topFraction) return 'top';
+  if (y <= height * (1 - bottomFraction)) return 'middle';
+  if (y > height - bottomGuard) return 'none';
+  return 'bottom';
+}
+
+/** True once the whole ball has left the table through its open bottom. */
+export function hasFallenOut(centreY: number, radius: number, floorY: number): boolean {
+  return centreY - radius > floorY;
 }

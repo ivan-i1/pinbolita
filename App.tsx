@@ -5,6 +5,7 @@ import {
   Modal,
   PanResponder,
   ScrollView,
+  StatusBar,
   StyleSheet,
   Switch,
   Text,
@@ -12,7 +13,6 @@ import {
   View,
 } from 'react-native';
 import { GameEngine } from 'react-native-game-engine';
-import { Accelerometer } from 'expo-sensors';
 import * as Haptics from 'expo-haptics';
 import { createAudioPlayer, setAudioModeAsync, AudioPlayer } from 'expo-audio';
 import * as DocumentPicker from 'expo-document-picker';
@@ -20,27 +20,37 @@ import { File, Paths } from 'expo-file-system';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Slider from '@react-native-community/slider';
 import {
-  applyRest,
-  capSpeed,
+  bandOf,
+  catchFraction,
   frameScale,
   frictionRetention,
+  hasFallenOut,
   impactGain,
   impulseAwayFrom,
-  isShake,
+  laneAfterCatch,
+  laneAfterLaunch,
+  laneLight,
+  laneOf,
+  laneTick,
   nextHue,
   pickVariant,
-  stepGravity,
-  swipeLaunch,
-  tiltPitch,
+  stepBall,
+  upwardLaunch,
+  type Band,
+  type Lane,
+  type LaneLight,
 } from './game/physics';
 
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
 
-const BALL_SIZE = 50;
+const BALL_SIZE = 28;
 const RADIUS = BALL_SIZE / 2;
 
 const DEFAULTS = {
-  tiltAccel: 1.3,
+  // Constant downward pull, px/frame² at 60 Hz. The table's only gravity: the
+  // accelerometer is not used at all.
+  pull: 0.2,
+  laneCooldown: 1.5, // seconds a lane stays dark after it launches the ball
   bounciness: 0.7,
   // 0 = frictionless, 1 = grips hardest. See frictionRetention: this used to be the
   // retention factor itself, which made the slider run backwards.
@@ -48,20 +58,20 @@ const DEFAULTS = {
   vibration: true,
   sound: true,
   basePitch: 1.0,
-  tiltPitchAmount: 0.5,
   colorOnBounce: false,
   bounceVolume: 1.0,
   hitVolume: 1.0,
+  debugBands: false, // tint the top/middle/bottom touch bands red/green/blue
 };
 
 // Every slider is divided into four, so each has step = (max - min) / 4 and the defaults
 // above sit exactly on a stop.
 const SLIDERS = {
-  tiltAccel: { min: 0.4, max: 4 },
+  pull: { min: 0.1, max: 0.5 },
+  laneCooldown: { min: 0.5, max: 2.5 },
   bounciness: { min: 0.1, max: 1.3 }, // above 1 the ball gains energy on a bounce
   friction: { min: 0, max: 1 },
   basePitch: { min: 0.5, max: 1.5 },
-  tiltPitchAmount: { min: 0, max: 1 },
   bounceVolume: { min: 0, max: 1 },
   hitVolume: { min: 0, max: 1 },
 } as const;
@@ -76,19 +86,9 @@ const HIT_SOUND_STORAGE_KEY = '@pinbolita:hit_sound';
 const HIT_SOUND_FILE_BASENAME = 'hit-sound';
 
 // Input and feel. Starting values — expect to tune these against a real device.
-const GRAVITY_LERP = 0.08; // how quickly the gravity estimate follows a new orientation
-const SHAKE_THRESHOLD = 0.15; // g of gravity-removed acceleration that counts as shaking
-// Turning the phone only rotates the 1g vector, so its magnitude stays ~1; actually
-// moving the phone does not. Without this second test a sustained tilt reads as a shake
-// for its whole sweep, because the gravity estimate lags it by GRAVITY_LERP per frame.
-const SHAKE_MAGNITUDE_THRESHOLD = 0.12;
-const SHAKE_GAIN = 18; // linear acceleration -> velocity
-const SHAKE_SOUND_COOLDOWN_MS = 110;
 const TAP_IMPULSE = 11; // tuned by hand on device — 9 read as slightly underpowered
 const TAP_MIN_DISTANCE = 1; // closer than this and the tap has no usable direction
-const REST_EPSILON = 0.08;
-const TILT_DEADZONE = 0.045;
-const MAX_SPEED = 40; // so a sustained shake cannot fling the ball out of the world
+const MAX_SPEED = 40; // so repeated nudges and launches cannot fling the ball out of the world
 
 // Sound variation.
 const VOICES_PER_VARIANT = 2;
@@ -99,12 +99,32 @@ const LOUD_SPEED = 14; // impact speed that plays at full volume
 const MIN_GAIN = 0.25;
 // Applied every frame, so it stays small: 0.98 retention still sheds ~70% in a second.
 const FRICTION_LOSS_AT_MAX = 0.02;
-// Flick-to-launch. Below MIN the gesture falls back to the tap shove.
+// Flick-to-launch. A drag no longer than MIN is a tap, not a swipe.
 const SWIPE_MIN_DISTANCE = 20;
 const SWIPE_GAIN = 0.09;
-// The bottom strip belongs to the control bar; swipes above it launch the ball.
-const BAR_GESTURE_ZONE = 0.85;
-const MAX_TILT_PITCH_RISE = 0.8; // full tilt at amount 1 plays 1.8x rate
+
+// Touch bands, by where a touch STARTS: top swipes open the bar and pause, middle taps
+// nudge the ball, bottom swipes launch it out of a lane.
+const TOP_BAND = 0.15;
+const BOTTOM_BAND = 0.22;
+// Android's home gesture owns the bottom 32 dp and no app can exclude it; a swipe
+// starting inside it never reaches us. Refuse the strip outright, with some margin.
+const BOTTOM_GESTURE_GUARD = 48;
+
+// Lanes are the flippers: a ready lane catches the ball, a swipe launches it, then that
+// lane cools down on its own timer. 1a ships a single lane across the full width.
+const LANE_COUNT = 1;
+const CATCH_FRACTION = 0.35; // share of the ball's area inside the lane before it catches
+const CATCH_EDGE_Y = SCREEN_HEIGHT * (1 - BOTTOM_BAND);
+// The worst single step is MAX_SPEED × the dtf clamp of 2 = 80 px. A shallower catch
+// band would let a stalled frame carry the ball straight over it.
+if (__DEV__ && SCREEN_HEIGHT - CATCH_EDGE_Y <= MAX_SPEED * 2 + BALL_SIZE) {
+  console.warn('[lanes] catch band is shallower than one worst-case step');
+}
+
+// The status bar area belongs to the system; the top bar and spawn point sit below it.
+const TOP_INSET = StatusBar.currentHeight ?? 0;
+const SPAWN = { x: SCREEN_WIDTH / 2, y: TOP_INSET + RADIUS + 24 };
 const RATE_HARD_MIN = 0.25; // expo-audio rejects rates outside roughly this range
 const RATE_HARD_MAX = 3.0;
 
@@ -113,13 +133,13 @@ const RATE_HARD_MAX = 3.0;
 const BALL_DEFAULT_COLOR = '#ff4081';
 const HUE_MIN_SEPARATION = 60;
 
-// Swipe-up control bar. The playfield is otherwise bare, so a permanently visible
+// Swipe-down control bar. The playfield is otherwise bare, so a permanently visible
 // grabber is the only affordance telling the player the gesture exists at all.
 const BAR_HEIGHT = 108;
 // The bar never hides completely: this much stays on screen so the grabber remains a
 // visible affordance. Hiding it entirely leaves the gesture undiscoverable.
-// 8 (bar paddingTop) + 5 (grabber) + slack. Must stay below 27, where the button row
-// starts, or the buttons peek above the bottom edge while the bar is "hidden".
+// 8 (grabber margin) + 5 (grabber) + slack. Must stay below the space under the button
+// row, or the buttons peek below the top edge while the bar is "hidden".
 const GRABBER_PEEK = 22;
 const BAR_HIDDEN_Y = BAR_HEIGHT - GRABBER_PEEK;
 const SWIPE_TRIGGER = 36; // px of travel on release that commits to show/hide
@@ -135,38 +155,32 @@ const PUSH_SOURCES = [require('./assets/push-1.wav'), require('./assets/push-2.w
 type PersistedSound = { uri: string; name: string };
 
 // Mutated by React state; read by the physics system every frame.
-const tilt = { x: 0, y: 0 };
 const settings = { ...DEFAULTS };
 
-// Taps and shakes land here and are drained once per frame. The sensor fires
-// independently of the render loop, so deriving impulses inside the frame would only
-// ever see the newest sample — and the samples in between are the shake.
+// Taps land here and are drained once per frame, ADDED to the ball's velocity: a nudge,
+// never a stop. Touch events arrive outside the frame loop, so they are banked.
 const pendingImpulse = { x: 0, y: 0 };
 
-// The low-frequency part of the accelerometer is gravity, i.e. how the phone is held.
-// Subtracting it leaves the movement. Seeded from the first sample, because starting at
-// zero would make that first reading look like a 1g shove.
-const gravity = { x: 0, y: 0 };
-let gravityReady = false;
-
-// Mirrors the `running` React state. The sensor listener keeps firing while the game is
-// paused, so without this a shake during a pause would bank up an impulse and fire the
-// whole thing the moment play resumes.
-let engineRunning = true;
+// Lane state and the loss flag live at module scope for the same reason as `settings`:
+// the frame loop and the touch responder both need them synchronously.
+const freshLanes = (): Lane[] =>
+  Array.from({ length: LANE_COUNT }, () => ({ phase: 'ready' as const, readyAt: 0 }));
+let lanes: Lane[] = freshLanes();
+let gameLost = false;
+// Registered by App so the frame loop, which runs outside React, can raise the overlay.
+let notifyLost: (() => void) | null = null;
 
 let bounceBank: AudioPlayer[] = [];
 let pushBank: AudioPlayer[] = [];
 let customBouncePlayer: AudioPlayer | null = null;
 let customPushPlayer: AudioPlayer | null = null;
-// Set while a finger is holding the ball. TiltSystem must see it, because otherwise it
-// re-accelerates the ball from tilt between touch events and the hold does not hold.
-let holdingBall = false;
 let ballHue = 340;
 let ballColor = BALL_DEFAULT_COLOR;
 let lastBounceVariant = -1;
 let lastPushVariant = -1;
-let lastPushSoundAt = 0;
 let voiceCursor = 0;
+
+const heldLane = () => lanes.findIndex((lane) => lane.phase === 'holding');
 
 const randomBetween = (lo: number, hi: number) => lo + Math.random() * (hi - lo);
 
@@ -183,23 +197,16 @@ const createBank = (sources: number[]) => {
   return bank;
 };
 
-// How far the phone is tilted right now, as a playback-rate multiplier. Read at play
-// time rather than stored, because the physics loop and the sensor both move faster
-// than React state does.
-const currentPitch = () =>
-  tiltPitch(
-    Math.hypot(tilt.x, tilt.y),
-    settings.basePitch,
-    settings.tiltPitchAmount,
-    MAX_TILT_PITCH_RISE,
-  );
+// Read at play time rather than stored, because the physics loop moves faster than React
+// state does. (The engine also raised the pitch with tilt; there is no tilt here.)
+const currentPitch = () => settings.basePitch;
 
 const playPlayer = (player: AudioPlayer, gain: number, pitch: number) => {
   try {
     // Must be setPlaybackRate(), not `player.playbackRate = x`. The type definitions
     // declare playbackRate as an assignable property, but the runtime object exposes
     // only a getter, so assigning throws — which typecheck and unit tests both miss.
-    // The per-hit random variation still applies; tilt multiplies it. Clamped because
+    // The per-hit random variation still applies; base pitch multiplies it. Clamped because
     // an out-of-range rate throws, and a thrown rate means silence, not a wrong pitch.
     const rate = randomBetween(RATE_MIN, RATE_MAX) * pitch;
     player.setPlaybackRate(Math.max(RATE_HARD_MIN, Math.min(RATE_HARD_MAX, rate)));
@@ -254,15 +261,6 @@ const playPushSound = () => {
   lastPushVariant = playFromBank(pushBank, lastPushVariant, gain, pitch);
 };
 
-// Shaking crosses the threshold many times a second; without a cooldown the push sound
-// turns into a machine gun.
-const maybePlayPushSound = () => {
-  const now = Date.now();
-  if (now - lastPushSoundAt < SHAKE_SOUND_COOLDOWN_MS) return;
-  lastPushSoundAt = now;
-  playPushSound();
-};
-
 const triggerBounceFeedback = (impactSpeed: number) => {
   if (impactSpeed < FEEDBACK_VELOCITY_THRESHOLD) return;
   if (settings.colorOnBounce) {
@@ -273,16 +271,21 @@ const triggerBounceFeedback = (impactSpeed: number) => {
   if (settings.sound) playBounceSound(impactGain(impactSpeed, LOUD_SPEED, MIN_GAIN));
 };
 
-const TiltSystem = (entities: any, { time }: any) => {
+const GameSystem = (entities: any, { time }: any) => {
   const box = entities.box;
 
-  // A held ball is frozen: no tilt, no banked impulses, no integration.
-  if (holdingBall) {
+  // Cooldowns run on the wall clock, so a lane recovers even while the ball is elsewhere.
+  const now = Date.now();
+  lanes = lanes.map((lane) => laneTick(lane, now));
+  entities.lanes.lights = lanes.map(laneLight);
+  box.color = settings.colorOnBounce ? ballColor : BALL_DEFAULT_COLOR;
+
+  // A caught ball is frozen until a bottom swipe launches it: no pull, no nudges.
+  if (gameLost || heldLane() >= 0) {
     box.velocity.x = 0;
     box.velocity.y = 0;
     pendingImpulse.x = 0;
     pendingImpulse.y = 0;
-    box.color = settings.colorOnBounce ? ballColor : BALL_DEFAULT_COLOR;
     return entities;
   }
 
@@ -290,29 +293,23 @@ const TiltSystem = (entities: any, { time }: any) => {
   // rate. Without this a 120Hz phone runs the ball twice as fast on the same numbers.
   const dtf = frameScale(time?.delta);
 
-  // Whatever the tap and shake handlers accumulated since the last frame.
+  // Whatever the tap handler banked since the last frame.
   box.velocity.x += pendingImpulse.x;
   box.velocity.y += pendingImpulse.y;
   pendingImpulse.x = 0;
   pendingImpulse.y = 0;
 
-  // The accelerometer reads +g on whichever axis points AWAY from the ground, so a
-  // positive reading means that edge is RAISED and the ball must roll the other way.
-  // Both axes were previously un-negated/negated the wrong way round, which made the
-  // ball drift toward the raised edge like a spirit-level bubble.
-  const ax = -tilt.x * settings.tiltAccel;
-  const ay = tilt.y * settings.tiltAccel;
-
-  const damping = Math.pow(frictionRetention(settings.friction, FRICTION_LOSS_AT_MAX), dtf);
-  box.velocity.x = (box.velocity.x + ax * dtf) * damping;
-  box.velocity.y = (box.velocity.y + ay * dtf) * damping;
-
-  const capped = capSpeed(box.velocity.x, box.velocity.y, MAX_SPEED);
-  box.velocity.x = capped.x;
-  box.velocity.y = capped.y;
-
-  box.position.x += box.velocity.x * dtf;
-  box.position.y += box.velocity.y * dtf;
+  const next = stepBall(
+    { x: box.position.x, y: box.position.y, vx: box.velocity.x, vy: box.velocity.y },
+    settings.pull,
+    dtf,
+    frictionRetention(settings.friction, FRICTION_LOSS_AT_MAX),
+    MAX_SPEED,
+  );
+  box.position.x = next.x;
+  box.position.y = next.y;
+  box.velocity.x = next.vx;
+  box.velocity.y = next.vy;
 
   if (box.position.x < RADIUS) {
     box.position.x = RADIUS;
@@ -324,32 +321,58 @@ const TiltSystem = (entities: any, { time }: any) => {
     box.velocity.x = -box.velocity.x * settings.bounciness;
   }
 
-  if (box.position.y < RADIUS) {
-    box.position.y = RADIUS;
-    triggerBounceFeedback(Math.abs(box.velocity.y));
-    box.velocity.y = -box.velocity.y * settings.bounciness;
-  } else if (box.position.y > SCREEN_HEIGHT - RADIUS) {
-    box.position.y = SCREEN_HEIGHT - RADIUS;
+  // Top wall only: the bottom is open, which is how the ball is lost.
+  if (box.position.y < TOP_INSET + RADIUS) {
+    box.position.y = TOP_INSET + RADIUS;
     triggerBounceFeedback(Math.abs(box.velocity.y));
     box.velocity.y = -box.velocity.y * settings.bounciness;
   }
 
-  // Friction only ever approaches zero, so without this the ball creeps forever and
-  // "put the phone down and it stops" is never quite true.
-  const rested = applyRest(
-    box.velocity.x,
-    box.velocity.y,
-    Math.hypot(tilt.x, tilt.y),
-    REST_EPSILON,
-    TILT_DEADZONE,
-  );
-  box.velocity.x = rested.x;
-  box.velocity.y = rested.y;
+  // A ready lane catches the ball once 35% of it has entered the lane band. The lane is
+  // chosen by the ball's centre, never by where the player's finger is.
+  if (catchFraction(box.position.y, CATCH_EDGE_Y, RADIUS) >= CATCH_FRACTION) {
+    const k = laneOf(box.position.x, SCREEN_WIDTH, LANE_COUNT);
+    const caught = laneAfterCatch(lanes[k]);
+    if (caught !== lanes[k]) {
+      lanes = lanes.map((lane, i) => (i === k ? caught : lane));
+      box.velocity.x = 0;
+      box.velocity.y = 0;
+      entities.lanes.lights = lanes.map(laneLight);
+      if (settings.vibration) Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+      return entities;
+    }
+  }
 
-  box.color = settings.colorOnBounce ? ballColor : BALL_DEFAULT_COLOR;
+  if (hasFallenOut(box.position.y, RADIUS, SCREEN_HEIGHT)) {
+    gameLost = true;
+    notifyLost?.();
+  }
 
   return entities;
 };
+
+// The lane strip along the bottom of the table. Lights: lit = a swipe will launch,
+// dark = cooling down, gray = standby.
+const LANE_COLORS: Record<LaneLight, string> = {
+  lit: 'rgba(3,218,198,0.45)',
+  dark: 'rgba(255,255,255,0.02)',
+  gray: 'rgba(255,255,255,0.10)',
+};
+
+const LaneStrip = ({ lights }: { lights: LaneLight[] }) => (
+  <View style={styles.laneStrip} pointerEvents="none">
+    {lights.map((light, i) => (
+      <View
+        key={i}
+        style={[
+          styles.lane,
+          { backgroundColor: LANE_COLORS[light] },
+          i > 0 && styles.laneDivider,
+        ]}
+      />
+    ))}
+  </View>
+);
 
 const Box = ({ position, size, color }: any) => {
   return (
@@ -367,11 +390,16 @@ const Box = ({ position, size, color }: any) => {
   );
 };
 
-// Built once, deliberately. GameEngine reads entities only at mount, and TouchSystem
-// needs a stable handle on the ball to work out which way "away from the tap" is.
+// Built once, deliberately. GameEngine reads entities only at mount, and the root touch
+// responder needs a stable handle on the ball to work out which way "away from the tap"
+// is. Lanes come first so the ball draws on top of them.
 const gameEntities = {
+  lanes: {
+    lights: lanes.map(laneLight),
+    renderer: <LaneStrip lights={[]} />,
+  },
   box: {
-    position: { x: SCREEN_WIDTH / 2, y: SCREEN_HEIGHT / 2 },
+    position: { x: SPAWN.x, y: SPAWN.y },
     velocity: { x: 0, y: 0 },
     size: [BALL_SIZE, BALL_SIZE],
     color: BALL_DEFAULT_COLOR,
@@ -420,6 +448,11 @@ const SettingsMenu = ({
           />
         </View>
 
+        <View style={styles.row}>
+          <Text style={styles.rowLabel}>Show touch bands (debug)</Text>
+          <Switch value={state.debugBands} onValueChange={(v) => onChange('debugBands', v)} />
+        </View>
+
         <TouchableOpacity style={styles.subMenuRow} onPress={onOpenSounds}>
           <Text style={styles.rowLabel}>Sounds</Text>
           <Text style={styles.subMenuChevron}>›</Text>
@@ -440,13 +473,13 @@ const SettingsMenu = ({
         </View>
 
         <View style={styles.sliderBlock}>
-          <Text style={styles.rowLabel}>Tilt pitch amount: {state.tiltPitchAmount.toFixed(2)}</Text>
+          <Text style={styles.rowLabel}>Pull: {state.pull.toFixed(2)}</Text>
           <Slider
-            minimumValue={SLIDERS.tiltPitchAmount.min}
-            maximumValue={SLIDERS.tiltPitchAmount.max}
-            step={quarterStep('tiltPitchAmount')}
-            value={state.tiltPitchAmount}
-            onValueChange={(v) => onChange('tiltPitchAmount', v)}
+            minimumValue={SLIDERS.pull.min}
+            maximumValue={SLIDERS.pull.max}
+            step={quarterStep('pull')}
+            value={state.pull}
+            onValueChange={(v) => onChange('pull', v)}
             minimumTrackTintColor="#03dac6"
             maximumTrackTintColor="#444"
             thumbTintColor="#03dac6"
@@ -454,13 +487,13 @@ const SettingsMenu = ({
         </View>
 
         <View style={styles.sliderBlock}>
-          <Text style={styles.rowLabel}>Tilt sensitivity: {state.tiltAccel.toFixed(2)}</Text>
+          <Text style={styles.rowLabel}>Lane cooldown: {state.laneCooldown.toFixed(1)} s</Text>
           <Slider
-            minimumValue={SLIDERS.tiltAccel.min}
-            maximumValue={SLIDERS.tiltAccel.max}
-            step={quarterStep('tiltAccel')}
-            value={state.tiltAccel}
-            onValueChange={(v) => onChange('tiltAccel', v)}
+            minimumValue={SLIDERS.laneCooldown.min}
+            maximumValue={SLIDERS.laneCooldown.max}
+            step={quarterStep('laneCooldown')}
+            value={state.laneCooldown}
+            onValueChange={(v) => onChange('laneCooldown', v)}
             minimumTrackTintColor="#03dac6"
             maximumTrackTintColor="#444"
             thumbTintColor="#03dac6"
@@ -628,61 +661,89 @@ export default function App() {
   const [state, setState] = useState<SettingsState>(DEFAULTS);
   const [customSoundName, setCustomSoundName] = useState<string | null>(null);
   const [customHitName, setCustomHitName] = useState<string | null>(null);
+  const [lost, setLost] = useState(false);
+  // The responder is created once, so it reads the loss through a ref, not state.
+  const lostRef = useRef(false);
 
-  // The bar lives translated off the bottom edge; 0 is shown, BAR_HEIGHT is hidden.
+  // The bar lives translated up behind the top edge; 0 is shown, -BAR_HIDDEN_Y is hidden.
   // Animated.Value rather than state so dragging never re-renders the game.
-  const barY = useRef(new Animated.Value(BAR_HIDDEN_Y)).current;
+  const barY = useRef(new Animated.Value(-BAR_HIDDEN_Y)).current;
   const barShown = useRef(false);
 
+  // Pulling the bar down pauses the table; putting it away resumes it. Banked nudges are
+  // dropped either way, so resuming never discharges a stored-up shove.
   const settleBar = (show: boolean) => {
     barShown.current = show;
+    pendingImpulse.x = 0;
+    pendingImpulse.y = 0;
+    setRunning(!show);
     Animated.timing(barY, {
-      toValue: show ? 0 : BAR_HIDDEN_Y,
+      toValue: show ? 0 : -BAR_HIDDEN_Y,
       duration: 180,
       useNativeDriver: true,
     }).start();
   };
 
-  // One responder, two jobs, split by where the finger lands. The bottom strip drives
-  // the control bar (as before); anywhere above it the finger catches the ball, holds it
-  // while dragging, and flicks it on release.
-  const onBar = useRef(false);
+  // One responder, three bands, chosen by where the finger LANDS:
+  //   top    — a vertical drag pulls the bar down (pause) or pushes it back (resume)
+  //   middle — taps only: a nudge ADDED to the ball's motion; drags do nothing
+  //   bottom — an upward swipe launches the ball out of whichever lane holds it
+  // Nothing freezes the ball on touch-down any more: with an open drain, a hold was a
+  // free, unlimited save.
+  const band = useRef<Band>('none');
 
   const swipe = useRef(
     PanResponder.create({
       onStartShouldSetPanResponder: (evt) => {
-        onBar.current = evt.nativeEvent.pageY > SCREEN_HEIGHT * BAR_GESTURE_ZONE;
-        if (onBar.current) return false; // let the bar's buttons take their own taps
-        holdingBall = true; // catch the ball the instant the finger lands
-        return true;
+        // While the loss overlay is up, its Continue button owns every touch.
+        if (lostRef.current) return false;
+        band.current = bandOf(
+          evt.nativeEvent.pageY,
+          SCREEN_HEIGHT,
+          TOP_BAND,
+          BOTTOM_BAND,
+          BOTTOM_GESTURE_GUARD,
+        );
+        // Top: let the bar's buttons take their own taps; a drag is claimed on move.
+        return band.current === 'middle' || band.current === 'bottom';
       },
       onMoveShouldSetPanResponder: (_evt, g) =>
-        onBar.current && Math.abs(g.dy) > SWIPE_CLAIM && Math.abs(g.dy) > Math.abs(g.dx),
+        !lostRef.current &&
+        band.current === 'top' &&
+        Math.abs(g.dy) > SWIPE_CLAIM &&
+        Math.abs(g.dy) > Math.abs(g.dx),
       onPanResponderMove: (_evt, g) => {
-        if (!onBar.current) return; // the ball is held; nothing to do until release
-        const base = barShown.current ? 0 : BAR_HIDDEN_Y;
-        barY.setValue(Math.max(0, Math.min(BAR_HIDDEN_Y, base + g.dy)));
+        if (band.current !== 'top') return;
+        const base = barShown.current ? 0 : -BAR_HIDDEN_Y;
+        barY.setValue(Math.max(-BAR_HIDDEN_Y, Math.min(0, base + g.dy)));
       },
       onPanResponderRelease: (evt, g) => {
-        if (onBar.current) {
-          if (g.dy < -SWIPE_TRIGGER) settleBar(true);
-          else if (g.dy > SWIPE_TRIGGER) settleBar(false);
+        const box = gameEntities.box;
+
+        if (band.current === 'top') {
+          if (g.dy > SWIPE_TRIGGER) settleBar(true);
+          else if (g.dy < -SWIPE_TRIGGER) settleBar(false);
           else settleBar(barShown.current);
           return;
         }
 
-        holdingBall = false;
-        const box = gameEntities.box;
-        const launch = swipeLaunch(g.dx, g.dy, SWIPE_MIN_DISTANCE, SWIPE_GAIN, MAX_SPEED);
-        if (launch) {
+        if (band.current === 'bottom') {
+          const k = heldLane();
+          if (k < 0) return; // nothing to launch: no lane is holding the ball
+          const launch = upwardLaunch(g.dx, g.dy, SWIPE_MIN_DISTANCE, SWIPE_GAIN, MAX_SPEED);
+          if (!launch) return;
+          lanes = lanes.map((lane, i) =>
+            i === k ? laneAfterLaunch(lane, Date.now(), settings.laneCooldown * 1000) : lane,
+          );
           box.velocity.x = launch.x;
           box.velocity.y = launch.y;
           playPushSound();
           return;
         }
 
-        // Too short to be a flick, so it was a tap: shove away from the finger, exactly
-        // as the old TouchSystem did.
+        // Middle band. A drag is not a tap, and a caught ball ignores nudges: only a
+        // launch releases it.
+        if (Math.hypot(g.dx, g.dy) > SWIPE_MIN_DISTANCE || heldLane() >= 0) return;
         const impulse = impulseAwayFrom(
           box.position.x,
           box.position.y,
@@ -697,11 +758,25 @@ export default function App() {
         playPushSound();
       },
       onPanResponderTerminate: () => {
-        holdingBall = false;
-        if (onBar.current) settleBar(barShown.current);
+        if (band.current === 'top') settleBar(barShown.current);
       },
     }),
   ).current;
+
+  // The ball fell through the open bottom: show the overlay and wait for Continue.
+  const continueAfterLoss = () => {
+    const box = gameEntities.box;
+    box.position.x = SPAWN.x;
+    box.position.y = SPAWN.y;
+    box.velocity.x = 0;
+    box.velocity.y = 0;
+    pendingImpulse.x = 0;
+    pendingImpulse.y = 0;
+    lanes = freshLanes();
+    gameLost = false;
+    lostRef.current = false;
+    setLost(false);
+  };
 
   useEffect(() => {
     // Sound effects should survive the iOS silent switch, and should sit alongside
@@ -712,43 +787,14 @@ export default function App() {
     pushBank = createBank(PUSH_SOURCES);
 
     // Module state outlives a Fast Refresh, so start from a known baseline.
-    engineRunning = true;
     pendingImpulse.x = 0;
     pendingImpulse.y = 0;
-
-    Accelerometer.setUpdateInterval(16);
-    const sub = Accelerometer.addListener(({ x, y, z }) => {
-      tilt.x = x;
-      tilt.y = y;
-
-      if (!gravityReady) {
-        gravity.x = x;
-        gravity.y = y;
-        gravityReady = true;
-        return;
-      }
-
-      const next = stepGravity(gravity.x, gravity.y, x, y, GRAVITY_LERP);
-      gravity.x = next.x;
-      gravity.y = next.y;
-
-      // What gravity does not account for is the phone actually being moved. Note this
-      // is the residual, not the difference between samples: differences telescope back
-      // to zero over a shake cycle, which would leave the ball jittering in place.
-      const linearX = x - gravity.x;
-      const linearY = y - gravity.y;
-
-      // Keep tracking gravity while paused so the estimate is current on resume, but do
-      // not bank impulses the player will never see applied.
-      if (!engineRunning) return;
-
-      // Residual alone cannot tell a tilt from a shake — see isShake.
-      if (isShake(linearX, linearY, Math.hypot(x, y, z), SHAKE_THRESHOLD, SHAKE_MAGNITUDE_THRESHOLD)) {
-        pendingImpulse.x += linearX * SHAKE_GAIN;
-        pendingImpulse.y += -linearY * SHAKE_GAIN; // flip y, same convention as the tilt
-        maybePlayPushSound();
-      }
-    });
+    lanes = freshLanes();
+    gameLost = false;
+    notifyLost = () => {
+      lostRef.current = true;
+      setLost(true);
+    };
 
     // Both custom-sound slots restore the same way: the OS can reclaim the copied file,
     // so a stored uri that no longer exists has its key purged rather than left dangling.
@@ -779,7 +825,7 @@ export default function App() {
     restoreSound(HIT_SOUND_STORAGE_KEY, (pl) => { customPushPlayer = pl; }, setCustomHitName);
 
     return () => {
-      sub.remove();
+      notifyLost = null;
       for (const player of [...bounceBank, ...pushBank]) player.remove();
       bounceBank = [];
       pushBank = [];
@@ -787,20 +833,8 @@ export default function App() {
       customBouncePlayer = null;
       customPushPlayer?.remove();
       customPushPlayer = null;
-      gravityReady = false;
     };
   }, []);
-
-  // Dual write, the same contract as `settings`: React state drives the button label,
-  // the module flag is what the sensor callback can actually read. Anything banked while
-  // paused is dropped, so resuming does not discharge a stored-up shove.
-  const toggleRunning = () => {
-    const next = !running;
-    engineRunning = next;
-    pendingImpulse.x = 0;
-    pendingImpulse.y = 0;
-    setRunning(next);
-  };
 
   const updateSetting = <K extends keyof SettingsState>(key: K, value: SettingsState[K]) => {
     settings[key] = value;
@@ -884,32 +918,28 @@ export default function App() {
     <View style={styles.container} {...swipe.panHandlers}>
       <GameEngine
         style={styles.gameContainer}
-        systems={[TiltSystem]}
+        systems={[GameSystem]}
         entities={gameEntities}
         running={running}
       >
+        {state.debugBands && (
+          <View style={StyleSheet.absoluteFill} pointerEvents="none">
+            <View style={[styles.debugBand, { height: SCREEN_HEIGHT * TOP_BAND, backgroundColor: 'rgba(255,0,0,0.22)' }]} />
+            <View style={[styles.debugBand, { flex: 1, backgroundColor: 'rgba(0,255,0,0.14)' }]} />
+            <View style={[styles.debugBand, { height: SCREEN_HEIGHT * BOTTOM_BAND - BOTTOM_GESTURE_GUARD, backgroundColor: 'rgba(0,90,255,0.26)' }]} />
+            <View style={[styles.debugBand, { height: BOTTOM_GESTURE_GUARD, backgroundColor: 'rgba(0,0,0,0.55)' }]} />
+          </View>
+        )}
+
         {/*
-          box-none so the bare playfield keeps receiving taps: only the bar itself and
-          the grabber are hit-testable, and the pan responder declines plain touches, so
-          a tap anywhere still reaches TouchSystem and shoves the ball.
+          Clipped below the status bar, so the hidden bar never shows through the system's
+          transparent status area. box-none keeps the playfield under it touchable.
         */}
         <View style={styles.controls} pointerEvents="box-none">
-          <Animated.View style={[styles.bottomBar, { transform: [{ translateY: barY }] }]}>
-            {/*
-              Android reserves the bottom-edge upward swipe for Home and does not let an
-              app exclude it, so an edge swipe can never reach us. The drag is therefore
-              handled at the root (anywhere on screen), and tapping the grabber toggles
-              the bar as a discoverable fallback.
-            */}
-            <TouchableOpacity
-              onPress={() => settleBar(!barShown.current)}
-              hitSlop={{ top: 12, bottom: 12, left: 40, right: 40 }}
-            >
-              <View style={styles.grabber} />
-            </TouchableOpacity>
+          <Animated.View style={[styles.topBar, { transform: [{ translateY: barY }] }]}>
             <View style={styles.buttonRow}>
-              <TouchableOpacity style={styles.button} onPress={toggleRunning}>
-                <Text style={styles.buttonText}>{running ? 'Pause' : 'Resume'}</Text>
+              <TouchableOpacity style={styles.button} onPress={() => settleBar(false)}>
+                <Text style={styles.buttonText}>Resume</Text>
               </TouchableOpacity>
               <TouchableOpacity
                 style={[styles.button, styles.secondaryButton]}
@@ -918,8 +948,28 @@ export default function App() {
                 <Text style={[styles.buttonText, styles.secondaryButtonText]}>Options</Text>
               </TouchableOpacity>
             </View>
+            {/*
+              Android gives the top edge to the notification shade, so the drag starts
+              anywhere in the top band instead, and tapping the grabber toggles the bar
+              as a discoverable fallback.
+            */}
+            <TouchableOpacity
+              onPress={() => settleBar(!barShown.current)}
+              hitSlop={{ top: 12, bottom: 12, left: 40, right: 40 }}
+            >
+              <View style={styles.grabber} />
+            </TouchableOpacity>
           </Animated.View>
         </View>
+
+        {lost && (
+          <View style={styles.lostOverlay}>
+            <Text style={styles.lostTitle}>You lost!</Text>
+            <TouchableOpacity style={styles.button} onPress={continueAfterLoss}>
+              <Text style={styles.buttonText}>Continue</Text>
+            </TouchableOpacity>
+          </View>
+        )}
       </GameEngine>
 
       <SettingsMenu
@@ -957,29 +1007,63 @@ const styles = StyleSheet.create({
   },
   controls: {
     position: 'absolute',
-    bottom: 0,
+    top: TOP_INSET,
+    height: BAR_HEIGHT,
     width: '100%',
     alignItems: 'center',
+    overflow: 'hidden',
     pointerEvents: 'box-none',
   },
-  bottomBar: {
+  topBar: {
     width: '100%',
     height: BAR_HEIGHT,
     alignItems: 'center',
-    justifyContent: 'flex-start',
-    paddingTop: 8,
+    justifyContent: 'space-between',
+    paddingTop: 14,
     backgroundColor: 'rgba(24,24,24,0.94)',
-    borderTopLeftRadius: 18,
-    borderTopRightRadius: 18,
+    borderBottomLeftRadius: 18,
+    borderBottomRightRadius: 18,
   },
-  // Sits above the bar's own top edge, so it stays on screen while the bar is hidden —
+  // Sits at the bar's bottom edge, so it stays on screen while the bar is hidden —
   // without it the swipe gesture has no affordance at all.
   grabber: {
     width: 44,
     height: 5,
     borderRadius: 3,
     backgroundColor: '#555',
-    marginBottom: 14,
+    marginBottom: 8,
+  },
+  debugBand: {
+    width: '100%',
+  },
+  laneStrip: {
+    position: 'absolute',
+    left: 0,
+    top: CATCH_EDGE_Y,
+    width: SCREEN_WIDTH,
+    height: SCREEN_HEIGHT - CATCH_EDGE_Y,
+    flexDirection: 'row',
+    borderTopWidth: 2,
+    borderTopColor: 'rgba(3,218,198,0.6)',
+  },
+  lane: {
+    flex: 1,
+  },
+  laneDivider: {
+    borderLeftWidth: 1,
+    borderLeftColor: 'rgba(255,255,255,0.25)',
+  },
+  lostOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(0,0,0,0.6)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 24,
+  },
+  lostTitle: {
+    color: 'white',
+    fontSize: 40,
+    fontWeight: 'bold',
   },
   buttonRow: {
     flexDirection: 'row',
