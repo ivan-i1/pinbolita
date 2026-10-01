@@ -21,24 +21,27 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import Slider from '@react-native-community/slider';
 import {
   bandOf,
+  canSwipeCatch,
   catchFraction,
   frameScale,
   frictionRetention,
   hasFallenOut,
   impactGain,
   impulseAwayFrom,
-  laneAfterCatch,
   laneAfterLaunch,
-  laneLight,
   laneOf,
+  laneRetention,
   laneTick,
+  laneVisual,
+  launchArrow,
+  mixColor,
   nextHue,
   pickVariant,
   stepBall,
-  upwardLaunch,
+  swipeLaunch,
   type Band,
   type Lane,
-  type LaneLight,
+  type LaneVisual,
 } from './game/physics';
 
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
@@ -50,7 +53,10 @@ const DEFAULTS = {
   // Constant downward pull, px/frame² at 60 Hz. The table's only gravity: the
   // accelerometer is not used at all.
   pull: 0.2,
-  laneCooldown: 1.5, // seconds a lane stays dark after it launches the ball
+  laneCooldown: 1.5, // seconds a lane cools down after it launches the ball
+  // Velocity kept per frame inside a ready lane: lower is thicker. 0.8 lets an ignored
+  // ball sink through the lane band in roughly 2.5 s on a 640 dp tall screen.
+  viscosity: 0.8,
   bounciness: 0.7,
   // 0 = frictionless, 1 = grips hardest. See frictionRetention: this used to be the
   // retention factor itself, which made the slider run backwards.
@@ -69,6 +75,7 @@ const DEFAULTS = {
 const SLIDERS = {
   pull: { min: 0.1, max: 0.5 },
   laneCooldown: { min: 0.5, max: 2.5 },
+  viscosity: { min: 0.7, max: 0.9 },
   bounciness: { min: 0.1, max: 1.3 }, // above 1 the ball gains energy on a bounce
   friction: { min: 0, max: 1 },
   basePitch: { min: 0.5, max: 1.5 },
@@ -111,16 +118,31 @@ const BOTTOM_BAND = 0.22;
 // starting inside it never reaches us. Refuse the strip outright, with some margin.
 const BOTTOM_GESTURE_GUARD = 48;
 
-// Lanes are the flippers: a ready lane catches the ball, a swipe launches it, then that
-// lane cools down on its own timer. 1a ships a single lane across the full width.
+// Lanes are the flippers. A lane's band is viscous: a ball in it keeps sinking slowly and
+// drains if ignored. Starting a swipe stops it; releasing launches it in any direction;
+// that lane then cools down on its own timer. 1a ships a single full-width lane.
 const LANE_COUNT = 1;
-const CATCH_FRACTION = 0.35; // share of the ball's area inside the lane before it catches
+const CATCH_FRACTION = 0.35; // share of the ball's area inside the band before it counts as in
 const CATCH_EDGE_Y = SCREEN_HEIGHT * (1 - BOTTOM_BAND);
-// The worst single step is MAX_SPEED × the dtf clamp of 2 = 80 px. A shallower catch
-// band would let a stalled frame carry the ball straight over it.
+// The worst single step is MAX_SPEED × the dtf clamp of 2 = 80 px. A shallower band
+// would let a stalled frame carry the ball straight over it.
 if (__DEV__ && SCREEN_HEIGHT - CATCH_EDGE_Y <= MAX_SPEED * 2 + BALL_SIZE) {
-  console.warn('[lanes] catch band is shallower than one worst-case step');
+  console.warn('[lanes] lane band is shallower than one worst-case step');
 }
+// A cooling lane is still thick, just less so, which is what makes the leniency usable:
+// at full speed a ball would cross the band in about a quarter of a second.
+const COOLING_RETENTION = 0.95;
+// A swipe may stop the ball this long before its lane's cooldown ends.
+const LENIENCY_MS = 500;
+// Launch-arrow length per unit of launch speed: the 40 cap draws a 160 px arrow.
+const ARROW_PX_PER_SPEED = 4;
+
+// Lane colours. Each state also differs in brightness, and cooldown draws a rising fill
+// with a ▲ marking "swipe now" — colour must not be the only cue (WCAG 1.4.1).
+const LANE_HOLDING = '#2ecc71';
+const LANE_COOL_FROM = '#3a3a3a';
+const LANE_COOL_TO = '#6e6214';
+const LANE_STANDBY = '#f2e45c';
 
 // The status bar area belongs to the system; the top bar and spawn point sit below it.
 const TOP_INSET = StatusBar.currentHeight ?? 0;
@@ -167,6 +189,15 @@ const freshLanes = (): Lane[] =>
   Array.from({ length: LANE_COUNT }, () => ({ phase: 'ready' as const, readyAt: 0 }));
 let lanes: Lane[] = freshLanes();
 let gameLost = false;
+// Set while a bottom-band swipe holds the ball still. `stopLane` launches it on release;
+// `aimFrom` is the drag already made when the stop began, so the shot is measured from
+// the moment the ball stopped, not from where the finger first landed.
+let ballStopped = false;
+let stopLane = -1;
+const aimFrom = { dx: 0, dy: 0 };
+// The launch preview, read by the arrow's renderer every frame.
+const arrow = { visible: false, length: 0, angle: 0 };
+let wasInBand = false;
 // Registered by App so the frame loop, which runs outside React, can raise the overlay.
 let notifyLost: (() => void) | null = null;
 
@@ -180,7 +211,28 @@ let lastBounceVariant = -1;
 let lastPushVariant = -1;
 let voiceCursor = 0;
 
-const heldLane = () => lanes.findIndex((lane) => lane.phase === 'holding');
+// Which lane the ball is in, and whether enough of it has entered the band to count.
+const ballLane = (x: number, y: number) => ({
+  k: laneOf(x, SCREEN_WIDTH, LANE_COUNT),
+  inBand: catchFraction(y, CATCH_EDGE_Y, RADIUS) >= CATCH_FRACTION,
+});
+
+// Stop the ball for a swipe, if its lane allows it right now. Returns whether it stopped.
+const tryStopBall = (): boolean => {
+  if (ballStopped || gameLost) return ballStopped;
+  const box = gameEntities.box;
+  const { k, inBand } = ballLane(box.position.x, box.position.y);
+  if (!inBand || !canSwipeCatch(lanes[k], Date.now(), LENIENCY_MS)) return false;
+  ballStopped = true;
+  stopLane = k;
+  return true;
+};
+
+const releaseStop = () => {
+  ballStopped = false;
+  stopLane = -1;
+  arrow.visible = false;
+};
 
 const randomBetween = (lo: number, hi: number) => lo + Math.random() * (hi - lo);
 
@@ -277,11 +329,19 @@ const GameSystem = (entities: any, { time }: any) => {
   // Cooldowns run on the wall clock, so a lane recovers even while the ball is elsewhere.
   const now = Date.now();
   lanes = lanes.map((lane) => laneTick(lane, now));
-  entities.lanes.lights = lanes.map(laneLight);
+  const here = ballLane(box.position.x, box.position.y);
+  entities.lanes.visuals = lanes.map((lane, i) =>
+    laneVisual(lane, now, settings.laneCooldown * 1000, !gameLost && here.inBand && i === here.k),
+  );
+  entities.arrow.x = box.position.x;
+  entities.arrow.y = box.position.y;
+  entities.arrow.visible = arrow.visible;
+  entities.arrow.length = arrow.length;
+  entities.arrow.angle = arrow.angle;
   box.color = settings.colorOnBounce ? ballColor : BALL_DEFAULT_COLOR;
 
-  // A caught ball is frozen until a bottom swipe launches it: no pull, no nudges.
-  if (gameLost || heldLane() >= 0) {
+  // Lost, or held still by a swipe in progress: no pull, no nudges until it is released.
+  if (gameLost || ballStopped) {
     box.velocity.x = 0;
     box.velocity.y = 0;
     pendingImpulse.x = 0;
@@ -299,11 +359,16 @@ const GameSystem = (entities: any, { time }: any) => {
   pendingImpulse.x = 0;
   pendingImpulse.y = 0;
 
+  // Inside a lane band the air turns to syrup: the pull keeps acting, so the ball sinks at
+  // a slow terminal speed instead of stopping — and drains if the player does nothing.
+  const retention = here.inBand
+    ? laneRetention(lanes[here.k], settings.viscosity, COOLING_RETENTION)
+    : frictionRetention(settings.friction, FRICTION_LOSS_AT_MAX);
   const next = stepBall(
     { x: box.position.x, y: box.position.y, vx: box.velocity.x, vy: box.velocity.y },
     settings.pull,
     dtf,
-    frictionRetention(settings.friction, FRICTION_LOSS_AT_MAX),
+    retention,
     MAX_SPEED,
   );
   box.position.x = next.x;
@@ -328,20 +393,13 @@ const GameSystem = (entities: any, { time }: any) => {
     box.velocity.y = -box.velocity.y * settings.bounciness;
   }
 
-  // A ready lane catches the ball once 35% of it has entered the lane band. The lane is
-  // chosen by the ball's centre, never by where the player's finger is.
-  if (catchFraction(box.position.y, CATCH_EDGE_Y, RADIUS) >= CATCH_FRACTION) {
-    const k = laneOf(box.position.x, SCREEN_WIDTH, LANE_COUNT);
-    const caught = laneAfterCatch(lanes[k]);
-    if (caught !== lanes[k]) {
-      lanes = lanes.map((lane, i) => (i === k ? caught : lane));
-      box.velocity.x = 0;
-      box.velocity.y = 0;
-      entities.lanes.lights = lanes.map(laneLight);
-      if (settings.vibration) Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-      return entities;
-    }
+  // A light tick as the ball sinks into a lane that can take a swipe. The lane is chosen by
+  // the ball's centre, never by where the player's finger is.
+  const after = ballLane(box.position.x, box.position.y);
+  if (after.inBand && !wasInBand && lanes[after.k].phase === 'ready' && settings.vibration) {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
   }
+  wasInBand = after.inBand;
 
   if (hasFallenOut(box.position.y, RADIUS, SCREEN_HEIGHT)) {
     gameLost = true;
@@ -351,28 +409,70 @@ const GameSystem = (entities: any, { time }: any) => {
   return entities;
 };
 
-// The lane strip along the bottom of the table. Lights: lit = a swipe will launch,
-// dark = cooling down, gray = standby.
-const LANE_COLORS: Record<LaneLight, string> = {
-  lit: 'rgba(3,218,198,0.45)',
-  dark: 'rgba(255,255,255,0.02)',
-  gray: 'rgba(255,255,255,0.10)',
+// The lane strip along the bottom of the table.
+//   holding  — green, ▲: the ball is sinking here and a swipe will stop and launch it
+//   cooldown — dark gray easing toward dark yellow, with a fill rising as it recovers
+//   standby  — bright yellow: an obvious jump, so the moment a lane is back is unmissable
+const laneColor = ({ kind, progress }: LaneVisual) => {
+  if (kind === 'holding') return LANE_HOLDING;
+  if (kind === 'standby') return LANE_STANDBY;
+  return mixColor(LANE_COOL_FROM, LANE_COOL_TO, progress);
 };
 
-const LaneStrip = ({ lights }: { lights: LaneLight[] }) => (
+const LaneStrip = ({ visuals }: { visuals: LaneVisual[] }) => (
   <View style={styles.laneStrip} pointerEvents="none">
-    {lights.map((light, i) => (
+    {visuals.map((visual, i) => (
       <View
         key={i}
-        style={[
-          styles.lane,
-          { backgroundColor: LANE_COLORS[light] },
-          i > 0 && styles.laneDivider,
-        ]}
-      />
+        style={[styles.lane, { backgroundColor: laneColor(visual) }, i > 0 && styles.laneDivider]}
+      >
+        {visual.kind === 'cooldown' && (
+          <View style={[styles.laneFill, { height: `${visual.progress * 100}%` }]} />
+        )}
+        {visual.kind === 'holding' && <Text style={styles.laneGlyph}>▲</Text>}
+      </View>
     ))}
   </View>
 );
+
+// The launch preview: a shaft from the ball's centre along the shot, with a head at the
+// tip. Its length is the launch speed, so it stops growing at the cap.
+const HEAD_HALF = 7; // half the arrowhead square's side
+const LaunchArrow = ({ visible, x, y, length, angle }: any) => {
+  if (!visible) return null;
+  const cos = Math.cos(angle);
+  const sin = Math.sin(angle);
+  return (
+    <View style={StyleSheet.absoluteFill} pointerEvents="none">
+      <View
+        style={[
+          styles.arrowShaft,
+          {
+            left: x + (cos * length) / 2 - length / 2,
+            top: y + (sin * length) / 2 - 2,
+            width: length,
+            transform: [{ rotate: `${angle}rad` }],
+          },
+        ]}
+      />
+      {/*
+        The head is a square showing two borders, rotated so that corner points along the
+        shot. That corner sits HEAD_HALF·√2 from the square's centre, so the centre is set
+        back by that much from the tip for the point to land exactly on it.
+      */}
+      <View
+        style={[
+          styles.arrowHead,
+          {
+            left: x + cos * (length - HEAD_HALF * Math.SQRT2) - HEAD_HALF,
+            top: y + sin * (length - HEAD_HALF * Math.SQRT2) - HEAD_HALF,
+            transform: [{ rotate: `${angle + Math.PI / 4}rad` }],
+          },
+        ]}
+      />
+    </View>
+  );
+};
 
 const Box = ({ position, size, color }: any) => {
   return (
@@ -392,11 +492,11 @@ const Box = ({ position, size, color }: any) => {
 
 // Built once, deliberately. GameEngine reads entities only at mount, and the root touch
 // responder needs a stable handle on the ball to work out which way "away from the tap"
-// is. Lanes come first so the ball draws on top of them.
+// is. Draw order follows key order: lanes, then the ball, then the arrow over both.
 const gameEntities = {
   lanes: {
-    lights: lanes.map(laneLight),
-    renderer: <LaneStrip lights={[]} />,
+    visuals: lanes.map((lane) => laneVisual(lane, 0, 0, false)),
+    renderer: <LaneStrip visuals={[]} />,
   },
   box: {
     position: { x: SPAWN.x, y: SPAWN.y },
@@ -404,6 +504,14 @@ const gameEntities = {
     size: [BALL_SIZE, BALL_SIZE],
     color: BALL_DEFAULT_COLOR,
     renderer: <Box />,
+  },
+  arrow: {
+    visible: false,
+    x: 0,
+    y: 0,
+    length: 0,
+    angle: 0,
+    renderer: <LaunchArrow />,
   },
 };
 
@@ -494,6 +602,20 @@ const SettingsMenu = ({
             step={quarterStep('laneCooldown')}
             value={state.laneCooldown}
             onValueChange={(v) => onChange('laneCooldown', v)}
+            minimumTrackTintColor="#03dac6"
+            maximumTrackTintColor="#444"
+            thumbTintColor="#03dac6"
+          />
+        </View>
+
+        <View style={styles.sliderBlock}>
+          <Text style={styles.rowLabel}>Lane viscosity: {state.viscosity.toFixed(2)} (lower = thicker)</Text>
+          <Slider
+            minimumValue={SLIDERS.viscosity.min}
+            maximumValue={SLIDERS.viscosity.max}
+            step={quarterStep('viscosity')}
+            value={state.viscosity}
+            onValueChange={(v) => onChange('viscosity', v)}
             minimumTrackTintColor="#03dac6"
             maximumTrackTintColor="#444"
             thumbTintColor="#03dac6"
@@ -704,6 +826,11 @@ export default function App() {
           BOTTOM_BAND,
           BOTTOM_GESTURE_GUARD,
         );
+        // Bottom: starting a swipe stops a ball sinking through a lane that allows it.
+        if (band.current === 'bottom' && tryStopBall()) {
+          aimFrom.dx = 0;
+          aimFrom.dy = 0;
+        }
         // Top: let the bar's buttons take their own taps; a drag is claimed on move.
         return band.current === 'middle' || band.current === 'bottom';
       },
@@ -713,6 +840,29 @@ export default function App() {
         Math.abs(g.dy) > SWIPE_CLAIM &&
         Math.abs(g.dy) > Math.abs(g.dx),
       onPanResponderMove: (_evt, g) => {
+        if (band.current === 'bottom') {
+          // A drag already under way also stops a ball that sinks into reach mid-swipe;
+          // the shot is then measured from that moment.
+          if (!ballStopped && tryStopBall()) {
+            aimFrom.dx = g.dx;
+            aimFrom.dy = g.dy;
+          }
+          if (!ballStopped) return;
+          const preview = launchArrow(
+            g.dx - aimFrom.dx,
+            g.dy - aimFrom.dy,
+            SWIPE_MIN_DISTANCE,
+            SWIPE_GAIN,
+            MAX_SPEED,
+            ARROW_PX_PER_SPEED,
+          );
+          arrow.visible = preview !== null;
+          if (preview) {
+            arrow.length = preview.length;
+            arrow.angle = preview.angle;
+          }
+          return;
+        }
         if (band.current !== 'top') return;
         const base = barShown.current ? 0 : -BAR_HIDDEN_Y;
         barY.setValue(Math.max(-BAR_HIDDEN_Y, Math.min(0, base + g.dy)));
@@ -728,9 +878,19 @@ export default function App() {
         }
 
         if (band.current === 'bottom') {
-          const k = heldLane();
-          if (k < 0) return; // nothing to launch: no lane is holding the ball
-          const launch = upwardLaunch(g.dx, g.dy, SWIPE_MIN_DISTANCE, SWIPE_GAIN, MAX_SPEED);
+          if (!ballStopped) return; // the swipe never had a ball to launch
+          const k = stopLane;
+          // Any direction — aiming into the drain is allowed — scaled by drag length.
+          const launch = swipeLaunch(
+            g.dx - aimFrom.dx,
+            g.dy - aimFrom.dy,
+            SWIPE_MIN_DISTANCE,
+            SWIPE_GAIN,
+            MAX_SPEED,
+          );
+          releaseStop();
+          // Too short to be a swipe: the ball simply resumes sinking, and the lane keeps
+          // its state — no launch, no cooldown.
           if (!launch) return;
           lanes = lanes.map((lane, i) =>
             i === k ? laneAfterLaunch(lane, Date.now(), settings.laneCooldown * 1000) : lane,
@@ -741,9 +901,9 @@ export default function App() {
           return;
         }
 
-        // Middle band. A drag is not a tap, and a caught ball ignores nudges: only a
-        // launch releases it.
-        if (Math.hypot(g.dx, g.dy) > SWIPE_MIN_DISTANCE || heldLane() >= 0) return;
+        // Middle band: taps only. A tap nudges the ball wherever it is, including while it
+        // sinks through a lane — juggling is part of the game.
+        if (Math.hypot(g.dx, g.dy) > SWIPE_MIN_DISTANCE) return;
         const impulse = impulseAwayFrom(
           box.position.x,
           box.position.y,
@@ -758,6 +918,8 @@ export default function App() {
         playPushSound();
       },
       onPanResponderTerminate: () => {
+        // Losing the touch to the system must never leave the ball stopped.
+        releaseStop();
         if (band.current === 'top') settleBar(barShown.current);
       },
     }),
@@ -773,6 +935,8 @@ export default function App() {
     pendingImpulse.x = 0;
     pendingImpulse.y = 0;
     lanes = freshLanes();
+    releaseStop();
+    wasInBand = false;
     gameLost = false;
     lostRef.current = false;
     setLost(false);
@@ -1048,6 +1212,36 @@ const styles = StyleSheet.create({
   },
   lane: {
     flex: 1,
+  },
+  laneFill: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(255,255,255,0.14)',
+  },
+  // At the top of the lane, where the ball enters: a ball sinking through the middle of the
+  // band would otherwise sit on top of it and hide it.
+  laneGlyph: {
+    color: 'white',
+    fontSize: 22,
+    fontWeight: 'bold',
+    textAlign: 'center',
+    marginTop: 2,
+  },
+  arrowShaft: {
+    position: 'absolute',
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: 'white',
+  },
+  arrowHead: {
+    position: 'absolute',
+    width: 2 * HEAD_HALF,
+    height: 2 * HEAD_HALF,
+    borderTopWidth: 4,
+    borderRightWidth: 4,
+    borderColor: 'white',
   },
   laneDivider: {
     borderLeftWidth: 1,

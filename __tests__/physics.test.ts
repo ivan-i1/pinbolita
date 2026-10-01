@@ -11,12 +11,14 @@ import {
   stepBall,
   catchFraction,
   laneOf,
-  laneAfterCatch,
   laneAfterLaunch,
   laneTick,
-  laneLight,
+  canSwipeCatch,
+  laneRetention,
+  laneVisual,
+  mixColor,
+  launchArrow,
   bandOf,
-  upwardLaunch,
   hasFallenOut,
   type Lane,
   type Rng,
@@ -374,35 +376,99 @@ describe('laneOf', () => {
 
 describe('lane state', () => {
   const ready: Lane = { phase: 'ready', readyAt: 0 };
+  const coolingUntil = (readyAt: number): Lane => ({ phase: 'cooldown', readyAt });
 
-  it('a ready lane catches the ball', () => {
-    expect(laneAfterCatch(ready).phase).toBe('holding');
+  it('launching starts the lane on its own cooldown', () => {
+    expect(laneAfterLaunch(ready, 1000, 1500)).toEqual({ phase: 'cooldown', readyAt: 2500 });
   });
 
-  it('a lane on cooldown does not catch — the ball falls through', () => {
-    const cooling: Lane = { phase: 'cooldown', readyAt: 5000 };
-    expect(laneAfterCatch(cooling)).toEqual(cooling);
-  });
-
-  it('launching from a holding lane starts its own cooldown', () => {
-    const next = laneAfterLaunch({ phase: 'holding', readyAt: 0 }, 1000, 1500);
-    expect(next).toEqual({ phase: 'cooldown', readyAt: 2500 });
-  });
-
-  it('a lane that is not holding cannot launch', () => {
-    expect(laneAfterLaunch(ready, 1000, 1500)).toEqual(ready);
+  it('a launch caught inside the leniency window restarts the cooldown', () => {
+    expect(laneAfterLaunch(coolingUntil(1200), 1000, 1500)).toEqual(coolingUntil(2500));
   });
 
   it('comes back ready once the cooldown has elapsed, not before', () => {
-    const cooling: Lane = { phase: 'cooldown', readyAt: 2500 };
-    expect(laneTick(cooling, 2499).phase).toBe('cooldown');
-    expect(laneTick(cooling, 2500).phase).toBe('ready');
+    expect(laneTick(coolingUntil(2500), 2499).phase).toBe('cooldown');
+    expect(laneTick(coolingUntil(2500), 2500).phase).toBe('ready');
   });
 
-  it('lights up while holding, darkens on cooldown, and is gray on standby', () => {
-    expect(laneLight({ phase: 'holding', readyAt: 0 })).toBe('lit');
-    expect(laneLight({ phase: 'cooldown', readyAt: 9 })).toBe('dark');
-    expect(laneLight(ready)).toBe('gray');
+  it('a ready lane can always stop the ball for a swipe', () => {
+    expect(canSwipeCatch(ready, 0, 500)).toBe(true);
+  });
+
+  it('a cooling lane cannot, until the last leniency window of its cooldown', () => {
+    expect(canSwipeCatch(coolingUntil(2500), 1999, 500)).toBe(false);
+    expect(canSwipeCatch(coolingUntil(2500), 2000, 500)).toBe(true);
+  });
+
+  it('a ready lane is the most viscous, a cooling lane less so', () => {
+    expect(laneRetention(ready, 0.8, 0.95)).toBe(0.8);
+    expect(laneRetention(coolingUntil(9), 0.8, 0.95)).toBe(0.95);
+  });
+});
+
+describe('viscous band', () => {
+  it('bleeds a fast ball down to the terminal speed pull·r/(1−r)', () => {
+    let ball = { x: 0, y: 0, vx: 0, vy: 10 };
+    for (let i = 0; i < 200; i++) ball = stepBall(ball, 0.2, 1, 0.8, 40);
+    expect(ball.vy).toBeCloseTo((0.2 * 0.8) / 0.2, 5);
+  });
+});
+
+describe('laneVisual', () => {
+  const ready: Lane = { phase: 'ready', readyAt: 0 };
+
+  it('is standby while ready with no ball in it', () => {
+    expect(laneVisual(ready, 0, 1500, false)).toEqual({ kind: 'standby', progress: 1 });
+  });
+
+  it('is holding while ready with the ball in it', () => {
+    expect(laneVisual(ready, 0, 1500, true)).toEqual({ kind: 'holding', progress: 1 });
+  });
+
+  it('shows how far the cooldown has run, ball or no ball', () => {
+    const lane: Lane = { phase: 'cooldown', readyAt: 2500 };
+    expect(laneVisual(lane, 1000, 1500, false)).toEqual({ kind: 'cooldown', progress: 0 });
+    expect(laneVisual(lane, 1750, 1500, true).progress).toBeCloseTo(0.5, 10);
+    expect(laneVisual(lane, 2499, 1500, false).progress).toBeLessThan(1);
+  });
+
+  it('never reports progress outside 0..1', () => {
+    const lane: Lane = { phase: 'cooldown', readyAt: 2500 };
+    expect(laneVisual(lane, 0, 1500, false).progress).toBe(0);
+  });
+});
+
+describe('mixColor', () => {
+  it('returns the endpoints at 0 and 1', () => {
+    expect(mixColor('#000000', '#ffffff', 0)).toBe('#000000');
+    expect(mixColor('#000000', '#ffffff', 1)).toBe('#ffffff');
+  });
+
+  it('blends channel by channel', () => {
+    expect(mixColor('#000000', '#ff8040', 0.5)).toBe('#804020');
+  });
+
+  it('clamps t outside 0..1', () => {
+    expect(mixColor('#102030', '#405060', 2)).toBe('#405060');
+  });
+});
+
+describe('launchArrow', () => {
+  it('shows nothing for a drag too short to launch', () => {
+    expect(launchArrow(0, -10, 20, 0.09, 40, 4)).toBeNull();
+  });
+
+  it('points the way the ball will go, any direction — the drain included', () => {
+    expect(launchArrow(0, -100, 20, 0.09, 40, 4)!.angle).toBeCloseTo(-Math.PI / 2, 10);
+    expect(launchArrow(0, 100, 20, 0.09, 40, 4)!.angle).toBeCloseTo(Math.PI / 2, 10);
+  });
+
+  it('grows with the drag and stops growing at the launch cap', () => {
+    const short = launchArrow(0, -100, 20, 0.09, 40, 4)!;
+    const long = launchArrow(0, -300, 20, 0.09, 40, 4)!;
+    const huge = launchArrow(0, -3000, 20, 0.09, 40, 4)!;
+    expect(long.length).toBeGreaterThan(short.length);
+    expect(huge.length).toBeCloseTo(40 * 4, 10);
   });
 });
 
@@ -425,24 +491,6 @@ describe('bandOf', () => {
     expect(band(150)).toBe('middle');
     expect(band(780)).toBe('middle');
     expect(band(780.1)).toBe('bottom');
-  });
-});
-
-describe('upwardLaunch', () => {
-  it('launches an upward swipe exactly like swipeLaunch', () => {
-    expect(upwardLaunch(10, -100, 20, 0.09, 40)).toEqual(swipeLaunch(10, -100, 20, 0.09, 40));
-  });
-
-  it('ignores a downward swipe — it would throw the ball into the drain', () => {
-    expect(upwardLaunch(0, 100, 20, 0.09, 40)).toBeNull();
-  });
-
-  it('ignores a purely sideways swipe', () => {
-    expect(upwardLaunch(100, 0, 20, 0.09, 40)).toBeNull();
-  });
-
-  it('still treats a short drag as no launch', () => {
-    expect(upwardLaunch(0, -10, 20, 0.09, 40)).toBeNull();
   });
 });
 

@@ -153,21 +153,27 @@ export function swipeLaunch(
 }
 
 /**
- * The launch a lane gives a caught ball: a flick, but only an upward one.
+ * The arrow previewing a launch: where the ball will go, and how hard.
  *
- * A downward or sideways swipe from the bottom lanes would throw the ball straight into
- * the drain, which is never what the player meant. Screen y grows down, so "upward" is
- * a negative dy.
+ * Launches go in any direction — aiming into the drain is allowed — so the arrow simply
+ * follows the swipe. Its length is the launch SPEED (capped), not the raw drag, so it
+ * stops growing exactly where extra drag stops adding power. Null means "no launch":
+ * the drag is still too short, and nothing should be drawn.
  */
-export function upwardLaunch(
+export function launchArrow(
   dx: number,
   dy: number,
   minDistance: number,
   gain: number,
   maxSpeed: number,
-): Vec | null {
-  if (dy >= 0) return null;
-  return swipeLaunch(dx, dy, minDistance, gain, maxSpeed);
+  pxPerSpeed: number,
+): { length: number; angle: number } | null {
+  const launch = swipeLaunch(dx, dy, minDistance, gain, maxSpeed);
+  if (!launch) return null;
+  return {
+    length: Math.hypot(launch.x, launch.y) * pxPerSpeed,
+    angle: Math.atan2(launch.y, launch.x),
+  };
 }
 
 export type Ball = { x: number; y: number; vx: number; vy: number };
@@ -224,18 +230,19 @@ export function laneOf(x: number, width: number, laneCount: number): number {
   return clamp(Math.floor((x / width) * laneCount), 0, laneCount - 1);
 }
 
-export type LanePhase = 'ready' | 'holding' | 'cooldown';
-/** `readyAt` is only meaningful while cooling down: the clock time it becomes ready. */
+/**
+ * A lane is either ready or cooling down. It never "holds" the ball: its band is viscous
+ * instead, so a ball in it keeps sinking slowly and drains if the player does nothing.
+ * `readyAt` is only meaningful while cooling down: the clock time it becomes ready.
+ */
+export type LanePhase = 'ready' | 'cooldown';
 export type Lane = { phase: LanePhase; readyAt: number };
 
-/** A ready lane catches the ball; a lane on cooldown lets it fall through to the drain. */
-export function laneAfterCatch(lane: Lane): Lane {
-  return lane.phase === 'ready' ? { phase: 'holding', readyAt: 0 } : lane;
-}
-
-/** Launching releases the ball and starts this lane's own cooldown. */
-export function laneAfterLaunch(lane: Lane, now: number, cooldownMs: number): Lane {
-  if (lane.phase !== 'holding') return lane;
+/**
+ * Launching starts this lane's own cooldown. A launch made inside the leniency window —
+ * while the lane was still cooling — restarts it from now.
+ */
+export function laneAfterLaunch(_lane: Lane, now: number, cooldownMs: number): Lane {
   return { phase: 'cooldown', readyAt: now + cooldownMs };
 }
 
@@ -244,13 +251,56 @@ export function laneTick(lane: Lane, now: number): Lane {
   return lane;
 }
 
-export type LaneLight = 'lit' | 'dark' | 'gray';
+/**
+ * Whether starting a swipe may stop the ball in this lane.
+ *
+ * Always when ready; while cooling, only in the last `leniencyMs` of the cooldown, so a
+ * swipe begun a moment early is not punished. Inclusive at the window's edge.
+ */
+export function canSwipeCatch(lane: Lane, now: number, leniencyMs: number): boolean {
+  return lane.phase === 'ready' || now >= lane.readyAt - leniencyMs;
+}
 
-/** Lit when a swipe will launch, dark while cooling down, gray on standby. */
-export function laneLight(lane: Lane): LaneLight {
-  if (lane.phase === 'holding') return 'lit';
-  if (lane.phase === 'cooldown') return 'dark';
-  return 'gray';
+/** Per-frame velocity retention inside a lane band: thickest when ready, thinner cooling. */
+export function laneRetention(lane: Lane, readyRetention: number, coolingRetention: number): number {
+  return lane.phase === 'ready' ? readyRetention : coolingRetention;
+}
+
+export type LaneVisual = { kind: 'standby' | 'holding' | 'cooldown'; progress: number };
+
+/**
+ * What a lane should show.
+ *
+ * holding — ready, with the ball sinking in it: a swipe will stop and launch it.
+ * cooldown — `progress` runs 0 → 1 across the cooldown, for a gradual colour and fill.
+ * standby — ready and empty.
+ *
+ * The leniency window deliberately does not show: it is a forgiveness, not a state.
+ */
+export function laneVisual(
+  lane: Lane,
+  now: number,
+  cooldownMs: number,
+  ballInLane: boolean,
+): LaneVisual {
+  if (lane.phase === 'cooldown') {
+    const remaining = lane.readyAt - now;
+    const progress = cooldownMs > 0 ? clamp(1 - remaining / cooldownMs, 0, 1) : 1;
+    return { kind: 'cooldown', progress };
+  }
+  return { kind: ballInLane ? 'holding' : 'standby', progress: 1 };
+}
+
+/** Linear blend of two #rrggbb colours; `t` is clamped to 0..1. */
+export function mixColor(from: string, to: string, t: number): string {
+  const k = clamp(t, 0, 1);
+  const channel = (hex: string, i: number) => parseInt(hex.slice(1 + i * 2, 3 + i * 2), 16);
+  let out = '#';
+  for (let i = 0; i < 3; i++) {
+    const v = Math.round(channel(from, i) + (channel(to, i) - channel(from, i)) * k);
+    out += v.toString(16).padStart(2, '0');
+  }
+  return out;
 }
 
 export type Band = 'top' | 'middle' | 'bottom' | 'none';
