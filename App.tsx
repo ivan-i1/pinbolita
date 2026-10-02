@@ -20,7 +20,9 @@ import { File, Paths } from 'expo-file-system';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Slider from '@react-native-community/slider';
 import {
+  bandEntryVelocity,
   bandOf,
+  cameraTarget,
   canSwipeCatch,
   catchFraction,
   frameScale,
@@ -29,15 +31,20 @@ import {
   impactGain,
   impulseAwayFrom,
   laneAfterLaunch,
+  laneCooldownMs,
   laneOf,
   laneRetention,
   laneTick,
   laneVisual,
   launchArrow,
+  mergeSettings,
   mixColor,
   nextHue,
+  panProgress,
   pickVariant,
+  screenToWorld,
   stepBall,
+  stepCamera,
   swipeLaunch,
   type Band,
   type Lane,
@@ -46,16 +53,27 @@ import {
 
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
 
-const BALL_SIZE = 28;
+// The table is one screen wide and TABLE_ASPECT widths tall, so it has the same shape on
+// every phone. Physics runs in dp, and every length and speed below is written for a
+// 360 dp wide table and multiplied by SCALE: a phone twice as wide gets a ball twice as
+// big moving twice as fast, which is the same game in table-width units.
+const REFERENCE_WIDTH = 360;
+const SCALE = SCREEN_WIDTH / REFERENCE_WIDTH;
+const TABLE_ASPECT = 4;
+const WORLD_HEIGHT = SCREEN_WIDTH * TABLE_ASPECT;
+
+const BALL_SIZE = 28 * SCALE;
 const RADIUS = BALL_SIZE / 2;
 
 const DEFAULTS = {
-  // Constant downward pull, px/frame² at 60 Hz. The table's only gravity: the
-  // accelerometer is not used at all.
+  // Constant downward pull, dp/frame² at 60 Hz on a 360 dp table. The table's only
+  // gravity: the accelerometer is not used at all.
   pull: 0.2,
-  laneCooldown: 1.5, // seconds a lane cools down after it launches the ball
+  laneCount: 1, // 1–4 equal lanes across the bottom
+  // Seconds of cooldown for a single lane; with more lanes each gets a share of it.
+  laneCooldown: 1.5,
   // Velocity kept per frame inside a ready lane: lower is thicker. 0.8 lets an ignored
-  // ball sink through the lane band in roughly 2.5 s on a 640 dp tall screen.
+  // ball sink through the lane band in roughly 2 s.
   viscosity: 0.8,
   bounciness: 0.7,
   // 0 = frictionless, 1 = grips hardest. See frictionRetention: this used to be the
@@ -68,7 +86,15 @@ const DEFAULTS = {
   bounceVolume: 1.0,
   hitVolume: 1.0,
   debugBands: false, // tint the top/middle/bottom touch bands red/green/blue
+  // Renderer spike (ADV-REV Q9 / dark area D1): measure the frame rate, and load the table
+  // with static bumper-sized views to see what the RN-View renderer can carry.
+  showFps: false,
+  stressViews: 0,
 };
+
+// Choice rows rather than sliders: these only make sense at these exact values.
+const LANE_COUNT_CHOICES = [1, 2, 3, 4];
+const STRESS_CHOICES = [0, 25, 50, 100];
 
 // Every slider is divided into four, so each has step = (max - min) / 4 and the defaults
 // above sit exactly on a stop.
@@ -83,6 +109,35 @@ const SLIDERS = {
   hitVolume: { min: 0, max: 1 },
 } as const;
 const quarterStep = (k: keyof typeof SLIDERS) => (SLIDERS[k].max - SLIDERS[k].min) / 4;
+// Ranges a persisted value is clamped back into on load (see mergeSettings).
+const SETTING_RANGES = {
+  ...SLIDERS,
+  laneCount: { min: 1, max: 4 },
+  stressViews: { min: 0, max: 100 },
+};
+const SETTINGS_STORAGE_KEY = '@pinbolita:settings';
+
+// Which settings each panel owns. Options is cosmetic only; Debug is every value that
+// changes how the game plays (ADV-REV Q23).
+const OPTION_KEYS = [
+  'vibration',
+  'sound',
+  'basePitch',
+  'colorOnBounce',
+  'bounceVolume',
+  'hitVolume',
+] as const;
+const DEBUG_KEYS = [
+  'pull',
+  'laneCount',
+  'laneCooldown',
+  'viscosity',
+  'bounciness',
+  'friction',
+  'debugBands',
+  'showFps',
+  'stressViews',
+] as const;
 
 // Bounces below this impact speed don't fire feedback — keeps the ball quiet when it's resting against a wall.
 const FEEDBACK_VELOCITY_THRESHOLD = 1.0;
@@ -93,20 +148,22 @@ const HIT_SOUND_STORAGE_KEY = '@pinbolita:hit_sound';
 const HIT_SOUND_FILE_BASENAME = 'hit-sound';
 
 // Input and feel. Starting values — expect to tune these against a real device.
-const TAP_IMPULSE = 11; // tuned by hand on device — 9 read as slightly underpowered
+const TAP_IMPULSE = 11 * SCALE; // tuned by hand on device — 9 read as slightly underpowered
 const TAP_MIN_DISTANCE = 1; // closer than this and the tap has no usable direction
-const MAX_SPEED = 40; // so repeated nudges and launches cannot fling the ball out of the world
+const MAX_SPEED = 40 * SCALE; // so repeated nudges and launches cannot fling the ball out of the world
 
 // Sound variation.
 const VOICES_PER_VARIANT = 2;
 const RATE_MIN = 0.82;
 const RATE_MAX = 1.22;
 const VOLUME_JITTER = 0.15;
-const LOUD_SPEED = 14; // impact speed that plays at full volume
+const LOUD_SPEED = 14 * SCALE; // impact speed that plays at full volume
 const MIN_GAIN = 0.25;
 // Applied every frame, so it stays small: 0.98 retention still sheds ~70% in a second.
 const FRICTION_LOSS_AT_MAX = 0.02;
-// Flick-to-launch. A drag no longer than MIN is a tap, not a swipe.
+// Flick-to-launch. A drag no longer than MIN is a tap, not a swipe. The gain is a ratio
+// (launch speed per dp of drag), so it is not scaled: a swipe across the same share of
+// the screen launches at the same share of the table on any phone.
 const SWIPE_MIN_DISTANCE = 20;
 const SWIPE_GAIN = 0.09;
 
@@ -120,21 +177,35 @@ const BOTTOM_GESTURE_GUARD = 48;
 
 // Lanes are the flippers. A lane's band is viscous: a ball in it keeps sinking slowly and
 // drains if ignored. Starting a swipe stops it; releasing launches it in any direction;
-// that lane then cools down on its own timer. 1a ships a single full-width lane.
-const LANE_COUNT = 1;
+// that lane then cools down on its own timer. They sit at the very bottom of the table.
 const CATCH_FRACTION = 0.35; // share of the ball's area inside the band before it counts as in
-const CATCH_EDGE_Y = SCREEN_HEIGHT * (1 - BOTTOM_BAND);
-// The worst single step is MAX_SPEED × the dtf clamp of 2 = 80 px. A shallower band
-// would let a stalled frame carry the ball straight over it.
-if (__DEV__ && SCREEN_HEIGHT - CATCH_EDGE_Y <= MAX_SPEED * 2 + BALL_SIZE) {
+const LANE_DEPTH = 0.4 * SCREEN_WIDTH;
+const CATCH_EDGE_Y = WORLD_HEIGHT - LANE_DEPTH;
+// The worst single step is MAX_SPEED × the dtf clamp of 2. A shallower band would let a
+// stalled frame carry the ball straight over it. Everything here scales together, so
+// this holds on every phone (144 > 108 at 360 dp); the check guards future edits.
+if (__DEV__ && LANE_DEPTH <= MAX_SPEED * 2 + BALL_SIZE) {
   console.warn('[lanes] lane band is shallower than one worst-case step');
 }
+
+// Camera: the view is the screen below the status bar, scrolling down the table. The
+// ball is held ANCHOR of the way down the view, eased by FOLLOW per 60 Hz frame.
+const VIEWPORT_HEIGHT = SCREEN_HEIGHT - (StatusBar.currentHeight ?? 0);
+const CAMERA_ANCHOR = 0.45;
+const CAMERA_FOLLOW = 0.15;
+// After Continue, the view pans back up to the spawn point before play resumes.
+const RESPAWN_PAN_MS = 900;
+// Speed a falling ball is capped to as it enters a lane band. Without it a ball dropped from
+// the top of the tall table arrives at MAX_SPEED and punches through the whole band (the
+// viscosity needs ~v·r/(1−r) of travel to absorb it). 6 keeps an ignored ball in a ready
+// lane for roughly 3 s.
+const LANE_ENTRY_SPEED = 6 * SCALE;
 // A cooling lane is still thick, just less so, which is what makes the leniency usable:
 // at full speed a ball would cross the band in about a quarter of a second.
 const COOLING_RETENTION = 0.95;
 // A swipe may stop the ball this long before its lane's cooldown ends.
 const LENIENCY_MS = 500;
-// Launch-arrow length per unit of launch speed: the 40 cap draws a 160 px arrow.
+// Launch-arrow length per unit of launch speed: the cap draws a 160 dp arrow at 360 dp.
 const ARROW_PX_PER_SPEED = 4;
 
 // Lane colours. Each state also differs in brightness, and cooldown draws a rising fill
@@ -144,9 +215,10 @@ const LANE_COOL_FROM = '#3a3a3a';
 const LANE_COOL_TO = '#6e6214';
 const LANE_STANDBY = '#f2e45c';
 
-// The status bar area belongs to the system; the top bar and spawn point sit below it.
+// The status bar area belongs to the system; the view of the table starts below it.
 const TOP_INSET = StatusBar.currentHeight ?? 0;
-const SPAWN = { x: SCREEN_WIDTH / 2, y: TOP_INSET + RADIUS + 24 };
+// World coordinates: the ball respawns top-centre of the table, at rest.
+const SPAWN = { x: SCREEN_WIDTH / 2, y: RADIUS + 24 * SCALE };
 const RATE_HARD_MIN = 0.25; // expo-audio rejects rates outside roughly this range
 const RATE_HARD_MAX = 3.0;
 
@@ -186,9 +258,17 @@ const pendingImpulse = { x: 0, y: 0 };
 // Lane state and the loss flag live at module scope for the same reason as `settings`:
 // the frame loop and the touch responder both need them synchronously.
 const freshLanes = (): Lane[] =>
-  Array.from({ length: LANE_COUNT }, () => ({ phase: 'ready' as const, readyAt: 0 }));
+  Array.from({ length: settings.laneCount }, () => ({ phase: 'ready' as const, readyAt: 0 }));
 let lanes: Lane[] = freshLanes();
 let gameLost = false;
+// The camera's top edge, in world dp. Every world renderer draws at
+// TOP_INSET + worldY - camera.y.
+const camera = { y: 0 };
+// While set, the view is panning back to the spawn point after Continue and the ball
+// waits there; play resumes when the pan lands.
+let respawnPan: { startedAt: number; from: number } | null = null;
+// Frame-rate estimate for the Debug FPS meter: an EMA of frame time.
+let frameMsAvg = 1000 / 60;
 // Set while a bottom-band swipe holds the ball still. `stopLane` launches it on release;
 // `aimFrom` is the drag already made when the stop began, so the shot is measured from
 // the moment the ball stopped, not from where the finger first landed.
@@ -213,13 +293,13 @@ let voiceCursor = 0;
 
 // Which lane the ball is in, and whether enough of it has entered the band to count.
 const ballLane = (x: number, y: number) => ({
-  k: laneOf(x, SCREEN_WIDTH, LANE_COUNT),
+  k: laneOf(x, SCREEN_WIDTH, lanes.length),
   inBand: catchFraction(y, CATCH_EDGE_Y, RADIUS) >= CATCH_FRACTION,
 });
 
 // Stop the ball for a swipe, if its lane allows it right now. Returns whether it stopped.
 const tryStopBall = (): boolean => {
-  if (ballStopped || gameLost) return ballStopped;
+  if (ballStopped || gameLost || respawnPan) return ballStopped;
   const box = gameEntities.box;
   const { k, inBand } = ballLane(box.position.x, box.position.y);
   if (!inBand || !canSwipeCatch(lanes[k], Date.now(), LENIENCY_MS)) return false;
@@ -323,35 +403,63 @@ const triggerBounceFeedback = (impactSpeed: number) => {
   if (settings.sound) playBounceSound(impactGain(impactSpeed, LOUD_SPEED, MIN_GAIN));
 };
 
-const GameSystem = (entities: any, { time }: any) => {
+// Hand this frame's shared state to the renderers. Each renderer only sees its own
+// entity, so the camera offset is copied onto every world-space entity.
+const publish = (entities: any, now: number, here: { k: number; inBand: boolean }) => {
   const box = entities.box;
-
-  // Cooldowns run on the wall clock, so a lane recovers even while the ball is elsewhere.
-  const now = Date.now();
-  lanes = lanes.map((lane) => laneTick(lane, now));
-  const here = ballLane(box.position.x, box.position.y);
+  const cooldownMs = laneCooldownMs(settings.laneCooldown, lanes.length);
   entities.lanes.visuals = lanes.map((lane, i) =>
-    laneVisual(lane, now, settings.laneCooldown * 1000, !gameLost && here.inBand && i === here.k),
+    laneVisual(lane, now, cooldownMs, !gameLost && here.inBand && i === here.k),
   );
   entities.arrow.x = box.position.x;
   entities.arrow.y = box.position.y;
   entities.arrow.visible = arrow.visible;
   entities.arrow.length = arrow.length;
   entities.arrow.angle = arrow.angle;
+  for (const key of ['guides', 'stress', 'lanes', 'box', 'arrow']) entities[key].camY = camera.y;
+  entities.stress.count = settings.stressViews;
+  entities.hud.fps = settings.showFps ? 1000 / frameMsAvg : 0;
   box.color = settings.colorOnBounce ? ballColor : BALL_DEFAULT_COLOR;
+};
 
-  // Lost, or held still by a swipe in progress: no pull, no nudges until it is released.
-  if (gameLost || ballStopped) {
+const GameSystem = (entities: any, { time }: any) => {
+  const box = entities.box;
+  const now = Date.now();
+
+  // The loop is driven by requestAnimationFrame, so it ticks at the display's refresh
+  // rate. Without this a 120Hz phone runs the ball twice as fast on the same numbers.
+  const delta = time?.delta;
+  const dtf = frameScale(delta);
+  if (Number.isFinite(delta) && delta > 0) {
+    frameMsAvg += (Math.min(delta, 250) - frameMsAvg) * 0.05;
+  }
+
+  // Cooldowns run on the wall clock, so a lane recovers even while the ball is elsewhere.
+  lanes = lanes.map((lane) => laneTick(lane, now));
+
+  // Camera: pan back up after Continue, otherwise follow the ball down the table. It holds
+  // still while the loss overlay is up.
+  if (respawnPan) {
+    const p = panProgress(now - respawnPan.startedAt, RESPAWN_PAN_MS);
+    camera.y = respawnPan.from * (1 - p);
+    if (p >= 1) respawnPan = null;
+  } else if (!gameLost) {
+    const target = cameraTarget(box.position.y, VIEWPORT_HEIGHT, WORLD_HEIGHT, CAMERA_ANCHOR);
+    camera.y = stepCamera(camera.y, target, dtf, CAMERA_FOLLOW);
+  }
+
+  const here = ballLane(box.position.x, box.position.y);
+
+  // Lost, panning back to the spawn, or held still by a swipe in progress: no pull, no
+  // nudges until play resumes.
+  if (gameLost || ballStopped || respawnPan) {
     box.velocity.x = 0;
     box.velocity.y = 0;
     pendingImpulse.x = 0;
     pendingImpulse.y = 0;
+    publish(entities, now, here);
     return entities;
   }
-
-  // The loop is driven by requestAnimationFrame, so it ticks at the display's refresh
-  // rate. Without this a 120Hz phone runs the ball twice as fast on the same numbers.
-  const dtf = frameScale(time?.delta);
 
   // Whatever the tap handler banked since the last frame.
   box.velocity.x += pendingImpulse.x;
@@ -366,7 +474,7 @@ const GameSystem = (entities: any, { time }: any) => {
     : frictionRetention(settings.friction, FRICTION_LOSS_AT_MAX);
   const next = stepBall(
     { x: box.position.x, y: box.position.y, vx: box.velocity.x, vy: box.velocity.y },
-    settings.pull,
+    settings.pull * SCALE,
     dtf,
     retention,
     MAX_SPEED,
@@ -386,9 +494,10 @@ const GameSystem = (entities: any, { time }: any) => {
     box.velocity.x = -box.velocity.x * settings.bounciness;
   }
 
-  // Top wall only: the bottom is open, which is how the ball is lost.
-  if (box.position.y < TOP_INSET + RADIUS) {
-    box.position.y = TOP_INSET + RADIUS;
+  // Top wall only — the top of the table, not of the screen. The bottom is open, which is
+  // how the ball is lost.
+  if (box.position.y < RADIUS) {
+    box.position.y = RADIUS;
     triggerBounceFeedback(Math.abs(box.velocity.y));
     box.velocity.y = -box.velocity.y * settings.bounciness;
   }
@@ -396,18 +505,28 @@ const GameSystem = (entities: any, { time }: any) => {
   // A light tick as the ball sinks into a lane that can take a swipe. The lane is chosen by
   // the ball's centre, never by where the player's finger is.
   const after = ballLane(box.position.x, box.position.y);
-  if (after.inBand && !wasInBand && lanes[after.k].phase === 'ready' && settings.vibration) {
+  const entering = after.inBand && !wasInBand;
+  // A ball falling in from high up the table arrives near the speed cap, faster than the
+  // band can absorb; cap it on the way in so it sinks instead of punching through.
+  const entry = bandEntryVelocity(box.velocity.x, box.velocity.y, entering, LANE_ENTRY_SPEED);
+  box.velocity.x = entry.x;
+  box.velocity.y = entry.y;
+  if (entering && lanes[after.k].phase === 'ready' && settings.vibration) {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
   }
   wasInBand = after.inBand;
 
-  if (hasFallenOut(box.position.y, RADIUS, SCREEN_HEIGHT)) {
+  if (hasFallenOut(box.position.y, RADIUS, WORLD_HEIGHT)) {
     gameLost = true;
     notifyLost?.();
   }
 
+  publish(entities, now, after);
   return entities;
 };
+
+// World y → screen y for the current camera.
+const toScreenY = (worldY: number, camY: number) => TOP_INSET + worldY - camY;
 
 // The lane strip along the bottom of the table.
 //   holding  — green, ▲: the ball is sinking here and a swipe will stop and launch it
@@ -419,8 +538,8 @@ const laneColor = ({ kind, progress }: LaneVisual) => {
   return mixColor(LANE_COOL_FROM, LANE_COOL_TO, progress);
 };
 
-const LaneStrip = ({ visuals }: { visuals: LaneVisual[] }) => (
-  <View style={styles.laneStrip} pointerEvents="none">
+const LaneStrip = ({ visuals, camY }: { visuals: LaneVisual[]; camY: number }) => (
+  <View style={[styles.laneStrip, { top: toScreenY(CATCH_EDGE_Y, camY ?? 0) }]} pointerEvents="none">
     {visuals.map((visual, i) => (
       <View
         key={i}
@@ -435,11 +554,62 @@ const LaneStrip = ({ visuals }: { visuals: LaneVisual[] }) => (
   </View>
 );
 
+// Faint lines across the table every table-width, plus its top edge, so that scrolling
+// down an otherwise empty table is visible at all.
+const TableGuides = ({ camY }: { camY: number }) => (
+  <View style={StyleSheet.absoluteFill} pointerEvents="none">
+    {Array.from({ length: TABLE_ASPECT }, (_, i) => (
+      <View
+        key={i}
+        style={[
+          styles.guide,
+          i === 0 && styles.guideTop,
+          { top: toScreenY(i * SCREEN_WIDTH, camY ?? 0) },
+        ]}
+      />
+    ))}
+  </View>
+);
+
+// Renderer spike (dark area D1): `count` static bumper-sized views spread over the table,
+// re-rendered every frame like real bumpers would be. They do not collide.
+const STRESS_SIZE = 0.12 * SCREEN_WIDTH;
+const StressViews = ({ count, camY }: { count: number; camY: number }) => {
+  if (!count) return null;
+  const usable = CATCH_EDGE_Y - STRESS_SIZE * 2;
+  return (
+    <View style={StyleSheet.absoluteFill} pointerEvents="none">
+      {Array.from({ length: count }, (_, i) => {
+        // Golden-ratio scatter: deterministic and evenly spread down the table.
+        const fx = (i * 0.6180339887) % 1;
+        const x = STRESS_SIZE / 2 + fx * (SCREEN_WIDTH - STRESS_SIZE);
+        const y = STRESS_SIZE + ((i + 0.5) / count) * usable;
+        return (
+          <View
+            key={i}
+            style={[
+              styles.stressView,
+              {
+                left: x - STRESS_SIZE / 2,
+                top: toScreenY(y, camY ?? 0) - STRESS_SIZE / 2,
+                width: STRESS_SIZE,
+                height: STRESS_SIZE,
+                borderRadius: STRESS_SIZE / 2,
+              },
+            ]}
+          />
+        );
+      })}
+    </View>
+  );
+};
+
 // The launch preview: a shaft from the ball's centre along the shot, with a head at the
 // tip. Its length is the launch speed, so it stops growing at the cap.
 const HEAD_HALF = 7; // half the arrowhead square's side
-const LaunchArrow = ({ visible, x, y, length, angle }: any) => {
+const LaunchArrow = ({ visible, x, y: worldY, length, angle, camY }: any) => {
   if (!visible) return null;
+  const y = toScreenY(worldY, camY ?? 0);
   const cos = Math.cos(angle);
   const sin = Math.sin(angle);
   return (
@@ -474,13 +644,13 @@ const LaunchArrow = ({ visible, x, y, length, angle }: any) => {
   );
 };
 
-const Box = ({ position, size, color }: any) => {
+const Box = ({ position, size, color, camY }: any) => {
   return (
     <View
       style={{
         position: 'absolute',
         left: position.x - size[0] / 2,
-        top: position.y - size[1] / 2,
+        top: toScreenY(position.y, camY ?? 0) - size[1] / 2,
         width: size[0],
         height: size[1],
         backgroundColor: color ?? BALL_DEFAULT_COLOR,
@@ -490,19 +660,28 @@ const Box = ({ position, size, color }: any) => {
   );
 };
 
+// Debug FPS readout, in screen space just under the pause bar's grabber.
+const Hud = ({ fps }: { fps: number }) =>
+  fps ? <Text style={styles.hud}>{fps.toFixed(0)} fps</Text> : null;
+
 // Built once, deliberately. GameEngine reads entities only at mount, and the root touch
 // responder needs a stable handle on the ball to work out which way "away from the tap"
-// is. Draw order follows key order: lanes, then the ball, then the arrow over both.
+// is. Draw order follows key order: guides and stress views at the back, then the lanes,
+// the ball, the arrow, and the HUD on top.
 const gameEntities = {
+  guides: { camY: 0, renderer: <TableGuides camY={0} /> },
+  stress: { count: 0, camY: 0, renderer: <StressViews count={0} camY={0} /> },
   lanes: {
     visuals: lanes.map((lane) => laneVisual(lane, 0, 0, false)),
-    renderer: <LaneStrip visuals={[]} />,
+    camY: 0,
+    renderer: <LaneStrip visuals={[]} camY={0} />,
   },
   box: {
     position: { x: SPAWN.x, y: SPAWN.y },
     velocity: { x: 0, y: 0 },
     size: [BALL_SIZE, BALL_SIZE],
     color: BALL_DEFAULT_COLOR,
+    camY: 0,
     renderer: <Box />,
   },
   arrow: {
@@ -511,13 +690,15 @@ const gameEntities = {
     y: 0,
     length: 0,
     angle: 0,
+    camY: 0,
     renderer: <LaunchArrow />,
   },
+  hud: { fps: 0, renderer: <Hud fps={0} /> },
 };
 
 type SettingsState = typeof DEFAULTS;
 
-const SettingsMenu = ({
+const OptionsMenu = ({
   visible,
   onClose,
   state,
@@ -556,11 +737,6 @@ const SettingsMenu = ({
           />
         </View>
 
-        <View style={styles.row}>
-          <Text style={styles.rowLabel}>Show touch bands (debug)</Text>
-          <Switch value={state.debugBands} onValueChange={(v) => onChange('debugBands', v)} />
-        </View>
-
         <TouchableOpacity style={styles.subMenuRow} onPress={onOpenSounds}>
           <Text style={styles.rowLabel}>Sounds</Text>
           <Text style={styles.subMenuChevron}>›</Text>
@@ -579,76 +755,143 @@ const SettingsMenu = ({
             thumbTintColor="#03dac6"
           />
         </View>
+        </ScrollView>
 
-        <View style={styles.sliderBlock}>
-          <Text style={styles.rowLabel}>Pull: {state.pull.toFixed(2)}</Text>
-          <Slider
-            minimumValue={SLIDERS.pull.min}
-            maximumValue={SLIDERS.pull.max}
-            step={quarterStep('pull')}
-            value={state.pull}
-            onValueChange={(v) => onChange('pull', v)}
-            minimumTrackTintColor="#03dac6"
-            maximumTrackTintColor="#444"
-            thumbTintColor="#03dac6"
-          />
+        <View style={styles.modalActions}>
+          <TouchableOpacity style={[styles.button, styles.secondaryButton]} onPress={onReset}>
+            <Text style={[styles.buttonText, styles.secondaryButtonText]}>Reset</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.button} onPress={onClose}>
+            <Text style={styles.buttonText}>Done</Text>
+          </TouchableOpacity>
         </View>
+      </View>
+    </View>
+  </Modal>
+);
 
-        <View style={styles.sliderBlock}>
-          <Text style={styles.rowLabel}>Lane cooldown: {state.laneCooldown.toFixed(1)} s</Text>
-          <Slider
-            minimumValue={SLIDERS.laneCooldown.min}
-            maximumValue={SLIDERS.laneCooldown.max}
-            step={quarterStep('laneCooldown')}
-            value={state.laneCooldown}
-            onValueChange={(v) => onChange('laneCooldown', v)}
-            minimumTrackTintColor="#03dac6"
-            maximumTrackTintColor="#444"
-            thumbTintColor="#03dac6"
-          />
-        </View>
+type Change = <K extends keyof SettingsState>(key: K, value: SettingsState[K]) => void;
+type SliderKey = keyof typeof SLIDERS;
 
-        <View style={styles.sliderBlock}>
-          <Text style={styles.rowLabel}>Lane viscosity: {state.viscosity.toFixed(2)} (lower = thicker)</Text>
-          <Slider
-            minimumValue={SLIDERS.viscosity.min}
-            maximumValue={SLIDERS.viscosity.max}
-            step={quarterStep('viscosity')}
-            value={state.viscosity}
-            onValueChange={(v) => onChange('viscosity', v)}
-            minimumTrackTintColor="#03dac6"
-            maximumTrackTintColor="#444"
-            thumbTintColor="#03dac6"
-          />
-        </View>
+const SliderRow = ({
+  label,
+  k,
+  state,
+  onChange,
+  format = (v: number) => v.toFixed(2),
+}: {
+  label: string;
+  k: SliderKey;
+  state: SettingsState;
+  onChange: Change;
+  format?: (v: number) => string;
+}) => (
+  <View style={styles.sliderBlock}>
+    <Text style={styles.rowLabel}>
+      {label}: {format(state[k])}
+    </Text>
+    <Slider
+      minimumValue={SLIDERS[k].min}
+      maximumValue={SLIDERS[k].max}
+      step={quarterStep(k)}
+      value={state[k]}
+      onValueChange={(v) => onChange(k, v)}
+      minimumTrackTintColor="#03dac6"
+      maximumTrackTintColor="#444"
+      thumbTintColor="#03dac6"
+    />
+  </View>
+);
 
-        <View style={styles.sliderBlock}>
-          <Text style={styles.rowLabel}>Bounciness: {state.bounciness.toFixed(2)}</Text>
-          <Slider
-            minimumValue={SLIDERS.bounciness.min}
-            maximumValue={SLIDERS.bounciness.max}
-            step={quarterStep('bounciness')}
-            value={state.bounciness}
-            onValueChange={(v) => onChange('bounciness', v)}
-            minimumTrackTintColor="#03dac6"
-            maximumTrackTintColor="#444"
-            thumbTintColor="#03dac6"
-          />
-        </View>
+// A row of exact choices, for values a slider would only ever land between.
+const ChoiceRow = ({
+  label,
+  choices,
+  value,
+  onPick,
+}: {
+  label: string;
+  choices: number[];
+  value: number;
+  onPick: (v: number) => void;
+}) => (
+  <View style={styles.sliderBlock}>
+    <Text style={styles.rowLabel}>{label}</Text>
+    <View style={styles.choiceRow}>
+      {choices.map((c) => (
+        <TouchableOpacity
+          key={c}
+          style={[styles.choice, c === value && styles.choiceOn]}
+          onPress={() => onPick(c)}
+          accessibilityState={{ selected: c === value }}
+        >
+          <Text style={[styles.choiceText, c === value && styles.choiceTextOn]}>{c}</Text>
+        </TouchableOpacity>
+      ))}
+    </View>
+  </View>
+);
 
-        <View style={styles.sliderBlock}>
-          <Text style={styles.rowLabel}>Friction: {state.friction.toFixed(2)}</Text>
-          <Slider
-            minimumValue={SLIDERS.friction.min}
-            maximumValue={SLIDERS.friction.max}
-            step={quarterStep('friction')}
-            value={state.friction}
-            onValueChange={(v) => onChange('friction', v)}
-            minimumTrackTintColor="#03dac6"
-            maximumTrackTintColor="#444"
-            thumbTintColor="#03dac6"
+// Every value that changes how the game plays (ADV-REV Q23). Options stays cosmetic.
+const DebugMenu = ({
+  visible,
+  onClose,
+  state,
+  onChange,
+  onReset,
+}: {
+  visible: boolean;
+  onClose: () => void;
+  state: SettingsState;
+  onChange: Change;
+  onReset: () => void;
+}) => (
+  <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
+    <View style={styles.modalBackdrop}>
+      <View style={styles.modalCard}>
+        <Text style={styles.modalTitle}>Debug</Text>
+        <ScrollView style={styles.modalScroll} contentContainerStyle={styles.modalScrollContent}>
+          <SliderRow label="Pull" k="pull" state={state} onChange={onChange} />
+          <ChoiceRow
+            label="Lanes"
+            choices={LANE_COUNT_CHOICES}
+            value={state.laneCount}
+            onPick={(v) => onChange('laneCount', v)}
           />
-        </View>
+          <SliderRow
+            label="Lane cooldown (one lane)"
+            k="laneCooldown"
+            state={state}
+            onChange={onChange}
+            format={(v) =>
+              `${v.toFixed(1)} s → ${(laneCooldownMs(v, state.laneCount) / 1000).toFixed(2)} s each`
+            }
+          />
+          <SliderRow
+            label="Lane viscosity (lower = thicker)"
+            k="viscosity"
+            state={state}
+            onChange={onChange}
+          />
+          <SliderRow label="Bounciness" k="bounciness" state={state} onChange={onChange} />
+          <SliderRow label="Friction" k="friction" state={state} onChange={onChange} />
+
+          <View style={styles.row}>
+            <Text style={styles.rowLabel}>Show touch bands</Text>
+            <Switch value={state.debugBands} onValueChange={(v) => onChange('debugBands', v)} />
+          </View>
+
+          <Text style={styles.sectionLabel}>Renderer spike</Text>
+          <View style={styles.row}>
+            <Text style={styles.rowLabel}>Show FPS</Text>
+            <Switch value={state.showFps} onValueChange={(v) => onChange('showFps', v)} />
+          </View>
+          <ChoiceRow
+            label="Stress views (bumper-sized, no collision)"
+            choices={STRESS_CHOICES}
+            value={state.stressViews}
+            onPick={(v) => onChange('stressViews', v)}
+          />
         </ScrollView>
 
         <View style={styles.modalActions}>
@@ -779,13 +1022,17 @@ const SoundsMenu = ({
 export default function App() {
   const [running, setRunning] = useState(true);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [debugOpen, setDebugOpen] = useState(false);
   const [soundsOpen, setSoundsOpen] = useState(false);
   const [state, setState] = useState<SettingsState>(DEFAULTS);
   const [customSoundName, setCustomSoundName] = useState<string | null>(null);
   const [customHitName, setCustomHitName] = useState<string | null>(null);
   const [lost, setLost] = useState(false);
-  // The responder is created once, so it reads the loss through a ref, not state.
+  // The app opens on the start menu (ADV-REV Q23); the table only runs in game mode.
+  const [screen, setScreen] = useState<'menu' | 'game'>('menu');
+  // The responder is created once, so it reads the loss and the menu through refs.
   const lostRef = useRef(false);
+  const menuRef = useRef(true);
 
   // The bar lives translated up behind the top edge; 0 is shown, -BAR_HIDDEN_Y is hidden.
   // Animated.Value rather than state so dragging never re-renders the game.
@@ -817,8 +1064,8 @@ export default function App() {
   const swipe = useRef(
     PanResponder.create({
       onStartShouldSetPanResponder: (evt) => {
-        // While the loss overlay is up, its Continue button owns every touch.
-        if (lostRef.current) return false;
+        // While the loss overlay or the start menu is up, its buttons own every touch.
+        if (lostRef.current || menuRef.current) return false;
         band.current = bandOf(
           evt.nativeEvent.pageY,
           SCREEN_HEIGHT,
@@ -836,6 +1083,7 @@ export default function App() {
       },
       onMoveShouldSetPanResponder: (_evt, g) =>
         !lostRef.current &&
+        !menuRef.current &&
         band.current === 'top' &&
         Math.abs(g.dy) > SWIPE_CLAIM &&
         Math.abs(g.dy) > Math.abs(g.dx),
@@ -893,7 +1141,9 @@ export default function App() {
           // its state — no launch, no cooldown.
           if (!launch) return;
           lanes = lanes.map((lane, i) =>
-            i === k ? laneAfterLaunch(lane, Date.now(), settings.laneCooldown * 1000) : lane,
+            i === k
+              ? laneAfterLaunch(lane, Date.now(), laneCooldownMs(settings.laneCooldown, lanes.length))
+              : lane,
           );
           box.velocity.x = launch.x;
           box.velocity.y = launch.y;
@@ -904,11 +1154,18 @@ export default function App() {
         // Middle band: taps only. A tap nudges the ball wherever it is, including while it
         // sinks through a lane — juggling is part of the game.
         if (Math.hypot(g.dx, g.dy) > SWIPE_MIN_DISTANCE) return;
+        // The finger is on the screen; the ball is on a scrolled table.
+        const finger = screenToWorld(
+          evt.nativeEvent.pageX,
+          evt.nativeEvent.pageY,
+          camera.y,
+          TOP_INSET,
+        );
         const impulse = impulseAwayFrom(
           box.position.x,
           box.position.y,
-          evt.nativeEvent.pageX,
-          evt.nativeEvent.pageY,
+          finger.x,
+          finger.y,
           TAP_IMPULSE,
           Math.random,
           TAP_MIN_DISTANCE,
@@ -926,7 +1183,8 @@ export default function App() {
   ).current;
 
   // The ball fell through the open bottom: show the overlay and wait for Continue.
-  const continueAfterLoss = () => {
+  // Ball back to the spawn point at rest, lanes fresh, nothing banked.
+  const resetTable = () => {
     const box = gameEntities.box;
     box.position.x = SPAWN.x;
     box.position.y = SPAWN.y;
@@ -942,6 +1200,23 @@ export default function App() {
     setLost(false);
   };
 
+  // Continue: the ball waits at the spawn while the view pans back up the table to it,
+  // so the player sees where play restarts (ADV-REV Q7). Play resumes when the pan lands.
+  const continueAfterLoss = () => {
+    resetTable();
+    respawnPan = { startedAt: Date.now(), from: camera.y };
+  };
+
+  // From the start menu: a fresh table, viewed from the top.
+  const startGame = () => {
+    resetTable();
+    respawnPan = null;
+    camera.y = 0;
+    menuRef.current = false;
+    setScreen('game');
+    setRunning(true);
+  };
+
   useEffect(() => {
     // Sound effects should survive the iOS silent switch, and should sit alongside
     // whatever the player is already listening to rather than seizing the audio session.
@@ -955,6 +1230,22 @@ export default function App() {
     pendingImpulse.y = 0;
     lanes = freshLanes();
     gameLost = false;
+    respawnPan = null;
+    camera.y = 0;
+
+    // Restore persisted settings. mergeSettings trusts nothing: unknown keys are dropped,
+    // wrong types fall back to defaults, numbers are clamped into their slider ranges.
+    AsyncStorage.getItem(SETTINGS_STORAGE_KEY)
+      .then((raw) => {
+        if (!raw) return;
+        const merged = mergeSettings(DEFAULTS, JSON.parse(raw), SETTING_RANGES);
+        merged.laneCount = Math.round(merged.laneCount);
+        if (!STRESS_CHOICES.includes(merged.stressViews)) merged.stressViews = 0;
+        Object.assign(settings, merged);
+        setState({ ...merged });
+        lanes = freshLanes();
+      })
+      .catch(() => {});
     notifyLost = () => {
       lostRef.current = true;
       setLost(true);
@@ -1000,14 +1291,39 @@ export default function App() {
     };
   }, []);
 
+  // Settings persist across launches (ADV-REV Q33, default: yes), written shortly after the
+  // last change so dragging a slider does not hammer storage.
+  const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const persistSettings = () => {
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(() => {
+      AsyncStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings)).catch(() => {});
+    }, 400);
+  };
+
+  // A different lane count is a different table: rebuild the lanes from scratch.
+  const applySideEffects = (key: keyof SettingsState) => {
+    if (key === 'laneCount') {
+      releaseStop();
+      lanes = freshLanes();
+    }
+  };
+
   const updateSetting = <K extends keyof SettingsState>(key: K, value: SettingsState[K]) => {
     settings[key] = value;
     setState((prev) => ({ ...prev, [key]: value }));
+    applySideEffects(key);
+    persistSettings();
   };
 
-  const resetSettings = () => {
-    Object.assign(settings, DEFAULTS);
-    setState({ ...DEFAULTS });
+  // Each panel resets only the values it owns.
+  const resetKeys = (keys: readonly (keyof SettingsState)[]) => {
+    const patch: Partial<SettingsState> = {};
+    for (const key of keys) (patch as Record<string, unknown>)[key] = DEFAULTS[key];
+    Object.assign(settings, patch);
+    setState((prev) => ({ ...prev, ...patch }));
+    for (const key of keys) applySideEffects(key);
+    persistSettings();
   };
 
   // Bounce and hit sounds are the same flow against different keys, so it is written
@@ -1084,7 +1400,7 @@ export default function App() {
         style={styles.gameContainer}
         systems={[GameSystem]}
         entities={gameEntities}
-        running={running}
+        running={running && screen === 'game'}
       >
         {state.debugBands && (
           <View style={StyleSheet.absoluteFill} pointerEvents="none">
@@ -1096,20 +1412,34 @@ export default function App() {
         )}
 
         {/*
+          The app draws edge-to-edge and the status bar is transparent, so anything on the
+          table scrolled above the view would show through behind the system icons.
+        */}
+        <View style={styles.statusBackdrop} pointerEvents="none" />
+
+        {/*
           Clipped below the status bar, so the hidden bar never shows through the system's
           transparent status area. box-none keeps the playfield under it touchable.
         */}
+        {screen === 'game' && (
         <View style={styles.controls} pointerEvents="box-none">
           <Animated.View style={[styles.topBar, { transform: [{ translateY: barY }] }]}>
+            {/* In game: Resume, Options, Debug (ADV-REV Q23). */}
             <View style={styles.buttonRow}>
-              <TouchableOpacity style={styles.button} onPress={() => settleBar(false)}>
+              <TouchableOpacity style={[styles.button, styles.barButton]} onPress={() => settleBar(false)}>
                 <Text style={styles.buttonText}>Resume</Text>
               </TouchableOpacity>
               <TouchableOpacity
-                style={[styles.button, styles.secondaryButton]}
+                style={[styles.button, styles.barButton, styles.secondaryButton]}
                 onPress={() => setMenuOpen(true)}
               >
                 <Text style={[styles.buttonText, styles.secondaryButtonText]}>Options</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.button, styles.barButton, styles.secondaryButton]}
+                onPress={() => setDebugOpen(true)}
+              >
+                <Text style={[styles.buttonText, styles.secondaryButtonText]}>Debug</Text>
               </TouchableOpacity>
             </View>
             {/*
@@ -1125,6 +1455,7 @@ export default function App() {
             </TouchableOpacity>
           </Animated.View>
         </View>
+        )}
 
         {lost && (
           <View style={styles.lostOverlay}>
@@ -1134,15 +1465,57 @@ export default function App() {
             </TouchableOpacity>
           </View>
         )}
+
+        {screen === 'menu' && (
+          <View style={styles.startMenu}>
+            <Text style={styles.startTitle}>Pinbolita</Text>
+            <TouchableOpacity style={[styles.button, styles.menuButton]} onPress={startGame}>
+              <Text style={[styles.buttonText, styles.menuButtonText]}>Game</Text>
+            </TouchableOpacity>
+            {/* Creative arrives in 1c; shown now so the menu has its final shape. */}
+            <View
+              style={[styles.button, styles.menuButton, styles.menuButtonDisabled]}
+              accessibilityState={{ disabled: true }}
+            >
+              <Text style={[styles.buttonText, styles.menuButtonText, styles.menuDisabledText]}>
+                Creative · soon
+              </Text>
+            </View>
+            <TouchableOpacity
+              style={[styles.button, styles.menuButton, styles.secondaryButton]}
+              onPress={() => setMenuOpen(true)}
+            >
+              <Text style={[styles.buttonText, styles.menuButtonText, styles.secondaryButtonText]}>
+                Options
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.button, styles.menuButton, styles.secondaryButton]}
+              onPress={() => setDebugOpen(true)}
+            >
+              <Text style={[styles.buttonText, styles.menuButtonText, styles.secondaryButtonText]}>
+                Debug
+              </Text>
+            </TouchableOpacity>
+          </View>
+        )}
       </GameEngine>
 
-      <SettingsMenu
+      <OptionsMenu
         visible={menuOpen}
         onClose={() => setMenuOpen(false)}
         state={state}
         onChange={updateSetting}
-        onReset={resetSettings}
+        onReset={() => resetKeys(OPTION_KEYS)}
         onOpenSounds={() => setSoundsOpen(true)}
+      />
+
+      <DebugMenu
+        visible={debugOpen}
+        onClose={() => setDebugOpen(false)}
+        state={state}
+        onChange={updateSetting}
+        onReset={() => resetKeys(DEBUG_KEYS)}
       />
 
       <SoundsMenu
@@ -1200,15 +1573,109 @@ const styles = StyleSheet.create({
   debugBand: {
     width: '100%',
   },
+  // `top` is set per frame from the camera.
   laneStrip: {
     position: 'absolute',
     left: 0,
-    top: CATCH_EDGE_Y,
     width: SCREEN_WIDTH,
-    height: SCREEN_HEIGHT - CATCH_EDGE_Y,
+    height: LANE_DEPTH,
     flexDirection: 'row',
     borderTopWidth: 2,
     borderTopColor: 'rgba(3,218,198,0.6)',
+  },
+  statusBackdrop: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    height: TOP_INSET,
+    backgroundColor: '#121212',
+  },
+  guide: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    height: 1,
+    backgroundColor: 'rgba(255,255,255,0.06)',
+  },
+  guideTop: {
+    height: 2,
+    backgroundColor: 'rgba(255,255,255,0.18)',
+  },
+  stressView: {
+    position: 'absolute',
+    backgroundColor: 'rgba(120,160,255,0.35)',
+    borderWidth: 2,
+    borderColor: 'rgba(120,160,255,0.8)',
+  },
+  hud: {
+    position: 'absolute',
+    top: TOP_INSET + GRABBER_PEEK + 4,
+    right: 10,
+    color: '#9fe',
+    fontSize: 13,
+    fontWeight: 'bold',
+  },
+  sectionLabel: {
+    color: '#03dac6',
+    fontSize: 13,
+    fontWeight: 'bold',
+    textTransform: 'uppercase',
+    marginTop: 16,
+    marginBottom: 4,
+  },
+  choiceRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 8,
+  },
+  choice: {
+    minWidth: 48,
+    paddingVertical: 8,
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: '#03dac6',
+    alignItems: 'center',
+  },
+  choiceOn: {
+    backgroundColor: '#03dac6',
+  },
+  choiceText: {
+    color: '#03dac6',
+    fontWeight: 'bold',
+  },
+  choiceTextOn: {
+    color: 'black',
+  },
+  barButton: {
+    paddingHorizontal: 14,
+  },
+  startMenu: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(18,18,18,0.92)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 16,
+  },
+  startTitle: {
+    color: 'white',
+    fontSize: 44,
+    fontWeight: 'bold',
+    marginBottom: 24,
+  },
+  menuButton: {
+    width: 220,
+    alignItems: 'center',
+    paddingVertical: 14,
+  },
+  menuButtonText: {
+    fontSize: 18,
+  },
+  menuButtonDisabled: {
+    backgroundColor: '#333',
+  },
+  menuDisabledText: {
+    color: '#888',
   },
   lane: {
     flex: 1,
@@ -1275,10 +1742,13 @@ const styles = StyleSheet.create({
     fontWeight: 'bold',
     fontSize: 16,
   },
+  // No elevation: on Android the shadow of a transparent button draws through it as a
+  // stray line across the middle of the outline.
   secondaryButton: {
     backgroundColor: 'transparent',
     borderWidth: 1,
     borderColor: '#03dac6',
+    elevation: 0,
   },
   secondaryButtonText: {
     color: '#03dac6',

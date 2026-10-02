@@ -329,3 +329,104 @@ export function bandOf(
 export function hasFallenOut(centreY: number, radius: number, floorY: number): boolean {
   return centreY - radius > floorY;
 }
+
+/**
+ * The velocity a ball keeps as it falls into a lane band.
+ *
+ * The band's viscosity bleeds speed over roughly v·r/(1−r) of travel. On a table several
+ * screens tall the ball arrives near the speed cap, which needs more than the whole band
+ * to bleed off, so it punched straight through and drained with no time to react. Capping
+ * the speed on the entry frame restores the slow sink the lanes are designed around.
+ * Only a ball moving down is touched: a launch out of the band keeps all its power.
+ */
+export function bandEntryVelocity(
+  vx: number,
+  vy: number,
+  entering: boolean,
+  maxEntrySpeed: number,
+): Vec {
+  if (!entering || vy <= 0) return { x: vx, y: vy };
+  return capSpeed(vx, vy, maxEntrySpeed);
+}
+
+/**
+ * Where the camera wants to be: the ball held `anchor` of the way down the viewport,
+ * clamped so the view never leaves the table. At the bottom it pins, which is what puts
+ * the lanes at the bottom of the screen exactly when the ball can reach them.
+ */
+export function cameraTarget(
+  ballY: number,
+  viewportHeight: number,
+  worldHeight: number,
+  anchor: number,
+): number {
+  const maxScroll = Math.max(0, worldHeight - viewportHeight);
+  return clamp(ballY - viewportHeight * anchor, 0, maxScroll);
+}
+
+/**
+ * Ease the camera toward its target. `follow` is the share of the gap closed per 60 Hz
+ * frame; raising the retention to the power of dtf keeps the pace per second identical
+ * at any refresh rate, like every other per-frame factor here.
+ */
+export function stepCamera(camera: number, target: number, dtf: number, follow: number): number {
+  const kept = Math.pow(1 - clamp(follow, 0, 1), dtf);
+  return target + (camera - target) * kept;
+}
+
+/** A touch on the screen, as a point on the scrolled table. */
+export function screenToWorld(
+  screenX: number,
+  screenY: number,
+  camera: number,
+  topInset: number,
+): Vec {
+  return { x: screenX, y: screenY - topInset + camera };
+}
+
+/** Eased 0 → 1 progress of a timed pan (smoothstep): gentle start and landing. */
+export function panProgress(elapsedMs: number, durationMs: number): number {
+  if (durationMs <= 0) return 1;
+  const t = clamp(elapsedMs / durationMs, 0, 1);
+  return t * t * (3 - 2 * t);
+}
+
+/**
+ * Each lane's cooldown: the base split across the lanes. One lane covers the whole width
+ * and waits longest; with more, each covers less and recovers sooner.
+ */
+export function laneCooldownMs(baseSeconds: number, laneCount: number): number {
+  return (baseSeconds * 1000) / Math.max(1, Math.floor(laneCount) || 1);
+}
+
+/**
+ * Rebuild settings from whatever was persisted, trusting nothing.
+ *
+ * Only keys the defaults know survive; a value of the wrong type falls back to its
+ * default; numbers are clamped into their slider range, and NaN or infinities rejected.
+ * A stored blob from an older or newer build therefore can never put the game into a
+ * state its own controls could not reach.
+ */
+export function mergeSettings<T extends Record<string, number | boolean>>(
+  defaults: T,
+  saved: unknown,
+  ranges: Partial<Record<keyof T, { min: number; max: number }>>,
+): T {
+  const out = { ...defaults };
+  if (saved === null || typeof saved !== 'object') return out;
+  const source = saved as Record<string, unknown>;
+  for (const key of Object.keys(defaults) as (keyof T)[]) {
+    const value = source[key as string];
+    if (typeof value !== typeof defaults[key]) continue;
+    if (typeof value === 'number') {
+      if (!Number.isFinite(value)) continue;
+      const range = ranges[key];
+      (out as Record<string, unknown>)[key as string] = range
+        ? clamp(value, range.min, range.max)
+        : value;
+    } else {
+      (out as Record<string, unknown>)[key as string] = value;
+    }
+  }
+  return out;
+}

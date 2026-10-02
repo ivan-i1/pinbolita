@@ -20,6 +20,13 @@ import {
   launchArrow,
   bandOf,
   hasFallenOut,
+  cameraTarget,
+  stepCamera,
+  screenToWorld,
+  panProgress,
+  laneCooldownMs,
+  mergeSettings,
+  bandEntryVelocity,
   type Lane,
   type Rng,
 } from '../game/physics';
@@ -501,5 +508,154 @@ describe('hasFallenOut', () => {
 
   it('is true once the whole ball has passed the bottom edge', () => {
     expect(hasFallenOut(1010.1, 10, 1000)).toBe(true);
+  });
+});
+
+describe('cameraTarget', () => {
+  // World 1600 tall, viewport 600, ball kept 45% down the viewport.
+  const target = (ballY: number) => cameraTarget(ballY, 600, 1600, 0.45);
+
+  it('keeps the ball at the anchor in the middle of the table', () => {
+    expect(target(800)).toBeCloseTo(800 - 270, 10);
+  });
+
+  it('never scrolls above the top of the table', () => {
+    expect(target(50)).toBe(0);
+  });
+
+  it('pins to the bottom, so the lanes sit at the bottom of the screen', () => {
+    expect(target(1590)).toBe(1000);
+  });
+
+  it('does not scroll at all when the table fits the viewport', () => {
+    expect(cameraTarget(300, 600, 500, 0.45)).toBe(0);
+  });
+});
+
+describe('stepCamera', () => {
+  it('moves part of the way toward the target each frame', () => {
+    const next = stepCamera(0, 100, 1, 0.2);
+    expect(next).toBeCloseTo(20, 10);
+  });
+
+  it('converges on the target', () => {
+    let cam = 0;
+    for (let i = 0; i < 200; i++) cam = stepCamera(cam, 100, 1, 0.2);
+    expect(cam).toBeCloseTo(100, 5);
+  });
+
+  it('follows at the same pace per second at 60Hz and 120Hz', () => {
+    let a = 0;
+    let b = 0;
+    for (let i = 0; i < 30; i++) a = stepCamera(a, 100, 1, 0.2);
+    for (let i = 0; i < 60; i++) b = stepCamera(b, 100, 0.5, 0.2);
+    expect(b).toBeCloseTo(a, 8);
+  });
+});
+
+describe('screenToWorld', () => {
+  it('maps a tap through the camera offset and the status-bar inset', () => {
+    expect(screenToWorld(120, 300, 500, 24)).toEqual({ x: 120, y: 776 });
+  });
+
+  it('is the identity at the top of the table with no inset', () => {
+    expect(screenToWorld(10, 20, 0, 0)).toEqual({ x: 10, y: 20 });
+  });
+});
+
+describe('panProgress', () => {
+  it('runs from 0 to 1 over the duration', () => {
+    expect(panProgress(0, 800)).toBe(0);
+    expect(panProgress(800, 800)).toBe(1);
+    expect(panProgress(5000, 800)).toBe(1);
+  });
+
+  it('eases: slow at both ends, half way at the midpoint', () => {
+    expect(panProgress(400, 800)).toBeCloseTo(0.5, 10);
+    expect(panProgress(80, 800)).toBeLessThan(0.1);
+  });
+
+  it('is monotonic', () => {
+    let last = -1;
+    for (let t = 0; t <= 800; t += 20) {
+      const p = panProgress(t, 800);
+      expect(p).toBeGreaterThanOrEqual(last);
+      last = p;
+    }
+  });
+});
+
+describe('laneCooldownMs', () => {
+  it('gives one lane the full cooldown', () => {
+    expect(laneCooldownMs(1.5, 1)).toBe(1500);
+  });
+
+  it('shortens each lane cooldown as the lanes multiply', () => {
+    expect(laneCooldownMs(1.5, 2)).toBe(750);
+    expect(laneCooldownMs(1.5, 4)).toBe(375);
+  });
+
+  it('treats a nonsense lane count as one lane', () => {
+    expect(laneCooldownMs(1.5, 0)).toBe(1500);
+  });
+});
+
+describe('bandEntryVelocity', () => {
+  it('slows a fast ball falling into a lane band to the entry cap, keeping its heading', () => {
+    // At max speed the viscous band would need ~160 px to bleed it off — deeper than the
+    // band — so without this a ball from the top of a tall table drains instantly.
+    const v = bandEntryVelocity(30, 40, true, 6);
+    expect(Math.hypot(v.x, v.y)).toBeCloseTo(6, 10);
+    expect(v.y / v.x).toBeCloseTo(40 / 30, 10);
+  });
+
+  it('leaves a slow ball alone', () => {
+    expect(bandEntryVelocity(1, 3, true, 6)).toEqual({ x: 1, y: 3 });
+  });
+
+  it('only acts on the frame the ball enters', () => {
+    expect(bandEntryVelocity(0, 40, false, 6)).toEqual({ x: 0, y: 40 });
+  });
+
+  it('never caps a ball moving up — a launch out of the band must keep its power', () => {
+    expect(bandEntryVelocity(0, -40, true, 6)).toEqual({ x: 0, y: -40 });
+  });
+});
+
+describe('mergeSettings', () => {
+  const defaults = { pull: 0.2, laneCount: 1, sound: true };
+  const ranges = { pull: { min: 0.1, max: 0.5 }, laneCount: { min: 1, max: 4 } };
+
+  it('falls back to the defaults for anything that is not an object', () => {
+    expect(mergeSettings(defaults, null, ranges)).toEqual(defaults);
+    expect(mergeSettings(defaults, 'junk', ranges)).toEqual(defaults);
+  });
+
+  it('keeps saved values of the right type', () => {
+    expect(mergeSettings(defaults, { pull: 0.3, sound: false }, ranges)).toEqual({
+      pull: 0.3,
+      laneCount: 1,
+      sound: false,
+    });
+  });
+
+  it('drops keys the app no longer has, and ignores values of the wrong type', () => {
+    expect(mergeSettings(defaults, { gone: 1, pull: 'fast', laneCount: 3 }, ranges)).toEqual({
+      pull: 0.2,
+      laneCount: 3,
+      sound: true,
+    });
+  });
+
+  it('clamps numbers back into their slider range', () => {
+    expect(mergeSettings(defaults, { pull: 9, laneCount: -2 }, ranges)).toEqual({
+      pull: 0.5,
+      laneCount: 1,
+      sound: true,
+    });
+  });
+
+  it('rejects NaN and infinities', () => {
+    expect(mergeSettings(defaults, { pull: NaN, laneCount: Infinity }, ranges)).toEqual(defaults);
   });
 });

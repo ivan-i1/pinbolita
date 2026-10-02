@@ -24,18 +24,33 @@ There is **no linter**. The automated gates are `npm test` and `npm run typechec
 only reach the pure maths. Touch, audio, rendering and game feel have no test coverage and must
 be verified on a device or emulator. Say what you actually ran.
 
-## The game (deliverable 1a)
+## The game (deliverables 1a + 1b)
 
+- The app opens on a **start menu**: Game, Creative (disabled until 1c), Options, Debug. In game,
+  pulling the top bar down pauses and offers Resume, Options, Debug.
+- **Options is cosmetic only** (sound, vibration, colours, pitch, volumes); **Debug is every
+  value that changes play** (pull, lanes, cooldown, viscosity, bounciness, friction, touch-band
+  overlay) plus the renderer-spike tools. All settings persist (`@pinbolita:settings`,
+  restored through `mergeSettings`, which trusts nothing it reads).
+- The table is **one screen wide and `TABLE_ASPECT` (4) widths tall**. A camera follows the ball
+  down it and pins at the bottom, which is what puts the lanes at the bottom of the screen
+  exactly when the ball can reach them. Continue pans the view back up to the spawn before play
+  resumes.
 - A small ball falls under a constant **pull** (`settings.pull`). There is **no accelerometer**:
   no tilt, no shake, no `expo-sensors`.
 - The table has side and top walls and an **open bottom**. A ball that falls through raises
   "You lost!" with a Continue button, which respawns it top-centre at rest.
-- **Lanes are the flippers, and their band is viscous.** The bottom band holds `LANE_COUNT`
-  equal lanes (1 in 1a). Once 35% of the ball's area is inside the band (`catchFraction`) the
+- **Lanes are the flippers, and their band is viscous.** The bottom `LANE_DEPTH` of the table
+  holds `settings.laneCount` (1–4) equal lanes; each gets `laneCooldownMs(base, count)` — more
+  lanes, shorter cooldowns. Once 35% of the ball's area is inside the band (`catchFraction`) the
   ball is "in" its lane — chosen by the ball's centre (`laneOf`), never by the finger. Inside,
   velocity retention drops to `settings.viscosity` (ready lane, ~2.5 s to sink through) or
   `COOLING_RETENTION` (cooling lane, thinner) while the pull keeps acting: the ball **sinks
   slowly and drains if ignored**. Nothing freezes it automatically.
+- **A falling ball is capped to `LANE_ENTRY_SPEED` as it enters a band** (`bandEntryVelocity`).
+  On the tall table it arrives near `MAX_SPEED`, and the viscosity needs ~v·r/(1−r) of travel to
+  absorb that — more than the band — so without the cap it punched straight through and drained
+  with no grace (seen on the emulator). Only downward entries are capped; launches keep power.
 - **Starting a swipe in the bottom band stops the ball** (`tryStopBall`), if its lane is ready —
   or in the last `LENIENCY_MS` (500 ms) of its cooldown (`canSwipeCatch`). A drag that reaches a
   sinking ball mid-swipe stops it too, and the shot is measured from that moment (`aimFrom`).
@@ -69,7 +84,9 @@ red/green/blue (and the refused strip black).
 - **`game/physics.ts`** — pure functions, **no imports**. Every decision that can be expressed as
   maths lives here so it can be tested: `stepBall`, `catchFraction`, `laneOf`, the lane state
   functions (`laneAfterLaunch`, `laneTick`, `canSwipeCatch`, `laneRetention`, `laneVisual`),
-  `mixColor`, `launchArrow`, `bandOf`, `hasFallenOut`, plus the engine's `frameScale`,
+  `mixColor`, `launchArrow`, `bandOf`, `hasFallenOut`, `bandEntryVelocity`, the camera
+  (`cameraTarget`, `stepCamera`, `screenToWorld`, `panProgress`), `laneCooldownMs`,
+  `mergeSettings`, plus the engine's `frameScale`,
   `impulseAwayFrom`, `capSpeed`, `impactGain`, `pickVariant`, `nextHue`, `frictionRetention`,
   `swipeLaunch`. New rules go here first, test-first.
 - **`App.tsx`** — everything that touches a device: `GameSystem` (the frame loop), the renderers,
@@ -77,7 +94,7 @@ red/green/blue (and the refused strip black).
 
 ### Module-scope mutable state is deliberate
 
-`settings`, `pendingImpulse`, `lanes`, `gameLost` and the audio banks are module-level
+`settings`, `pendingImpulse`, `lanes`, `gameLost`, `camera`, `respawnPan` and the audio banks are module-level
 singletons, not React state, because the frame loop and the touch responder run outside React's
 render cycle and need synchronous reads. Consequence: a **required dual write** — `updateSetting`
 writes both the module `settings` object and React state. Add a setting and update only one and
@@ -85,10 +102,11 @@ the UI moves while the ball ignores it, or the reverse.
 
 ### The frame loop
 
-`GameSystem` ticks lane cooldowns and publishes lane visuals and the arrow, returns early while
-the ball is stopped by a swipe or lost, drains `pendingImpulse`, calls `stepBall` with the lane's
-viscous retention when the ball is in a band (friction otherwise), bounces off side and top
-walls, then checks fall-out.
+`GameSystem` ticks lane cooldowns, moves the camera (respawn pan, or eased follow), returns early
+while the ball is stopped, lost or waiting out the pan, drains `pendingImpulse`, calls `stepBall`
+with the lane's viscous retention when the ball is in a band (friction otherwise), bounces off
+side and top walls, caps the entry speed into a band, checks fall-out, then `publish`es lane
+visuals, the arrow, the camera offset and the FPS estimate onto the entities.
 
 - **Everything is scaled by `dtf`** (`frameScale`), because the loop runs at the display's
   refresh rate. `frameScale` returns exactly 1 at 60 Hz. Any new force must be `dtf`-scaled.
@@ -96,11 +114,26 @@ walls, then checks fall-out.
   constant pull that hung a respawned ball in mid-air forever (worse at 120 Hz). A test pins it.
 - **Bounce order matters**: clamp position, fire feedback with the pre-reflection speed, then
   reflect and damp.
-- **Tunnelling floor**: the worst single step is `MAX_SPEED × 2` (the dtf clamp) = 80 px, so the
-  lane band must be deeper than that plus the ball's diameter. A `__DEV__` warning checks it.
+- **Tunnelling floor**: the worst single step is `MAX_SPEED × 2` (the dtf clamp), so the lane
+  band must be deeper than that plus the ball's diameter (144 > 108 at 360 dp, and it scales).
+  A `__DEV__` warning checks it.
 
-Screen bounds are read once from `Dimensions.get('window')`; `app.json` locks portrait. The
-table is exactly one screen in 1a — world units and a scrolling camera are deliverable 1b.
+### World units and the camera
+
+Physics runs in **world dp**: x across the screen width, y down a table `WORLD_HEIGHT =
+SCREEN_WIDTH × TABLE_ASPECT` tall. Every length and speed is written for a 360 dp table and
+multiplied by `SCALE = SCREEN_WIDTH / 360` (ball size, `MAX_SPEED`, `TAP_IMPULSE`, the pull, lane
+depth), so the same table plays the same in table-width units on any phone. Ratios are not
+scaled (`SWIPE_GAIN`, retentions). Renderers draw at `toScreenY(worldY, camY) = TOP_INSET +
+worldY − camY`; each world entity receives `camY` from `publish`. Taps are mapped back with
+`screenToWorld`. Touch **bands** stay in screen space. Screen bounds are read once from
+`Dimensions.get('window')`; `app.json` locks portrait.
+
+### Renderer spike (ADV-REV Q9 / D1)
+
+Debug → Renderer spike: **Show FPS** (EMA of frame time, top right) and **Stress views** (0–100
+bumper-sized views re-rendered every frame, no collision). This is how to decide RN Views vs
+Skia **on a physical phone**: the emulator renders in software and its numbers mean nothing.
 
 ### Sound bank
 
@@ -116,7 +149,8 @@ false`, so pitch moves with rate.
 
 Custom bounce/hit sounds are copied into `Paths.document` under fixed basenames and recorded in
 AsyncStorage (`@pinbolita:bounce_sound`, `@pinbolita:hit_sound`), using the SDK 54 object-based
-`expo-file-system` API (`File`, `Paths`). Settings themselves are **not** persisted.
+`expo-file-system` API (`File`, `Paths`). Settings persist separately under
+`@pinbolita:settings` (see The game).
 
 ## Native project is generated, not committed
 
