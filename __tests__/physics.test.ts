@@ -27,6 +27,14 @@ import {
   laneCooldownMs,
   mergeSettings,
   bandEntryVelocity,
+  substepCount,
+  collideCircle,
+  cellOf,
+  cellCenter,
+  canPlace,
+  parseLayout,
+  serializeLayout,
+  type Bumper,
   type Lane,
   type Rng,
 } from '../game/physics';
@@ -657,5 +665,173 @@ describe('mergeSettings', () => {
 
   it('rejects NaN and infinities', () => {
     expect(mergeSettings(defaults, { pull: NaN, laneCount: Infinity }, ranges)).toEqual(defaults);
+  });
+});
+
+describe('substepCount', () => {
+  it('takes one step when the ball moves less than the max step', () => {
+    expect(substepCount(5, 7, 8)).toBe(1);
+  });
+
+  it('splits a fast frame so no step is longer than the max', () => {
+    expect(substepCount(40, 7, 8)).toBe(6);
+  });
+
+  it('never exceeds the substep budget', () => {
+    expect(substepCount(1000, 7, 8)).toBe(8);
+  });
+
+  it('treats a still ball as one step', () => {
+    expect(substepCount(0, 7, 8)).toBe(1);
+  });
+});
+
+describe('collideCircle', () => {
+  // Bumper at (100, 100); ball radius + bumper radius = 30.
+  const hit = (x: number, y: number, vx: number, vy: number, kick = 0) =>
+    collideCircle({ x, y, vx, vy }, 100, 100, 30, kick);
+
+  it('ignores a ball that is not touching', () => {
+    const r = hit(100, 50, 0, 5);
+    expect(r.hit).toBe(false);
+    expect(r.ball).toEqual({ x: 100, y: 50, vx: 0, vy: 5 });
+  });
+
+  it('pushes an overlapping ball out to the contact distance', () => {
+    const r = hit(100, 80, 0, 5);
+    expect(r.hit).toBe(true);
+    expect(r.ball.y).toBeCloseTo(70, 10);
+    expect(r.ball.x).toBeCloseTo(100, 10);
+  });
+
+  it('reflects a head-on hit straight back', () => {
+    const r = hit(100, 80, 0, 5);
+    expect(r.ball.vy).toBeCloseTo(-5, 10);
+    expect(r.ball.vx).toBeCloseTo(0, 10);
+  });
+
+  it('adds the kick along the outward normal — a bumper gives energy back', () => {
+    const r = hit(100, 80, 0, 5, 8);
+    expect(r.ball.vy).toBeCloseTo(-13, 10);
+  });
+
+  it('keeps the tangential part of a glancing hit', () => {
+    // Ball to the left of the bumper, moving right and down: only vx reverses.
+    const r = hit(80, 100, 4, 3);
+    expect(r.ball.vx).toBeCloseTo(-4, 10);
+    expect(r.ball.vy).toBeCloseTo(3, 10);
+  });
+
+  it('reports the impact speed along the normal, for sound and haptics', () => {
+    expect(hit(100, 80, 3, 5).impact).toBeCloseTo(5, 10);
+  });
+
+  it('does not kick a ball that is already moving away', () => {
+    const r = hit(100, 80, 0, -5, 8);
+    expect(r.ball.vy).toBeCloseTo(-5, 10);
+    expect(r.impact).toBe(0);
+  });
+
+  it('survives a ball exactly on the centre without NaN, pushing it up', () => {
+    const r = hit(100, 100, 0, 0, 8);
+    expect(Number.isFinite(r.ball.x) && Number.isFinite(r.ball.y)).toBe(true);
+    expect(r.ball.y).toBeCloseTo(70, 10);
+  });
+});
+
+describe('build grid', () => {
+  it('finds the cell under a point in table-width units', () => {
+    expect(cellOf(0.3, 1.05, 8)).toEqual({ col: 2, row: 8 });
+  });
+
+  it('clamps points past the right edge into the last column', () => {
+    expect(cellOf(1, 0.5, 8).col).toBe(7);
+  });
+
+  it('gives the centre of a cell', () => {
+    expect(cellCenter(2, 8, 8)).toEqual({ x: 0.3125, y: 1.0625 });
+  });
+
+  const bumper = (x: number, y: number): Bumper => ({ id: 'b', type: 'bumper', x, y, r: 0.05, power: 1 });
+  const place = (col: number, row: number, items: Bumper[] = []) =>
+    canPlace(col, row, items, 8, 4, 0.4, 0.05);
+
+  it('allows an empty cell on the open table', () => {
+    expect(place(3, 10)).toBe(true);
+  });
+
+  it('keeps the spawn row clear', () => {
+    expect(place(3, 0)).toBe(false);
+  });
+
+  it('keeps the lane band clear, including a bumper overhanging it', () => {
+    // Lanes start at 4 − 0.4 = 3.6 tw. Row 28's centre is 3.5625; plus r 0.05 is 3.6125.
+    expect(place(3, 27)).toBe(true);
+    expect(place(3, 28)).toBe(false);
+  });
+
+  it('refuses a cell that is already taken', () => {
+    const c = cellCenter(3, 10, 8);
+    expect(place(3, 10, [bumper(c.x, c.y)])).toBe(false);
+  });
+
+  it('allows the neighbouring cell — bumpers on adjacent cells do not overlap', () => {
+    const c = cellCenter(3, 10, 8);
+    expect(place(4, 10, [bumper(c.x, c.y)])).toBe(true);
+  });
+
+  it('refuses cells off the grid', () => {
+    expect(place(-1, 10)).toBe(false);
+    expect(place(8, 10)).toBe(false);
+    expect(place(3, 32)).toBe(false);
+  });
+});
+
+describe('layout persistence', () => {
+  const b1: Bumper = { id: 'b1', type: 'bumper', x: 0.5, y: 1.2, r: 0.05, power: 1.5 };
+
+  it('round-trips a layout through JSON', () => {
+    const json = JSON.stringify(serializeLayout([b1], 4, 8));
+    expect(parseLayout(JSON.parse(json), 4)).toEqual({ valid: true, items: [b1] });
+  });
+
+  it('writes the versioned envelope', () => {
+    expect(serializeLayout([b1], 4, 8)).toEqual({
+      v: 1,
+      units: 'tw',
+      aspect: 4,
+      grid: 8,
+      items: [b1],
+    });
+  });
+
+  it('flags anything that is not a v1 layout as invalid, so it can be kept aside', () => {
+    expect(parseLayout(null, 4).valid).toBe(false);
+    expect(parseLayout({ v: 2, items: [] }, 4).valid).toBe(false);
+    expect(parseLayout({ v: 1, items: 'nope' }, 4).valid).toBe(false);
+  });
+
+  it('skips parts it does not know — later deliverables add pads and more', () => {
+    const r = parseLayout({ v: 1, items: [{ id: 'p1', type: 'pad', x: 0.5, y: 1 }, b1] }, 4);
+    expect(r.items).toEqual([b1]);
+  });
+
+  it('drops malformed bumpers and clamps the rest onto the table', () => {
+    const r = parseLayout(
+      {
+        v: 1,
+        items: [
+          { id: 'bad', type: 'bumper', x: 'left', y: 1, r: 0.05, power: 1 },
+          { id: 'far', type: 'bumper', x: 3, y: 9, r: 0.05, power: 9 },
+        ],
+      },
+      4,
+    );
+    expect(r.items).toEqual([{ id: 'far', type: 'bumper', x: 0.95, y: 3.95, r: 0.05, power: 2 }]);
+  });
+
+  it('keeps only the first of two bumpers sharing an id', () => {
+    const r = parseLayout({ v: 1, items: [b1, { ...b1, x: 0.2 }] }, 4);
+    expect(r.items).toEqual([b1]);
   });
 });

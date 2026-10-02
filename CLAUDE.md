@@ -24,10 +24,31 @@ There is **no linter**. The automated gates are `npm test` and `npm run typechec
 only reach the pure maths. Touch, audio, rendering and game feel have no test coverage and must
 be verified on a device or emulator. Say what you actually ran.
 
-## The game (deliverables 1a + 1b)
+## The game (deliverables 1a + 1b + 1c)
 
-- The app opens on a **start menu**: Game, Creative (disabled until 1c), Options, Debug. In game,
-  pulling the top bar down pauses and offers Resume, Options, Debug.
+- The app opens on a **start menu**: Game, Creative, Options, Debug. In game, pulling the top bar
+  down pauses and offers Resume, Options, Debug, Menu. Game and Creative are **independent
+  modes**; Game plays an empty table (ADV-REV Q32, default — only Test plays the layout). Menu
+  on the bar and the Creative strip is beyond the spec's lists: without it, there was no way
+  between the two modes.
+- **Creative** (`mode === 'creative'`): no ball, no physics, play bands off. A right-side tool
+  strip (`STRIP_WIDTH`) holds the current part, Parts, Debug, Test, Menu. On the table, a tap
+  places a bumper of the selected power in the grid cell under the finger (`GRID_CELLS` = 8 across,
+  centres only) or removes the bumper already there; a vertical drag scrolls the view. A ghost
+  cell shows the outcome while the finger is down (place / remove / blocked). The spawn row and
+  the lane band are no-build (`canPlace`). Parts picks the power of new bumpers (×0.5–×2) and
+  can clear the table (behind a confirm).
+- **Test** plays the layout and hands back to Creative on **pause** (top-band drag) or **loss**
+  (ADV-REV Q16). `activeBumpers` is what physics collides with: the layout in Test, nothing in
+  Game.
+- **Bumpers** (`collideCircle`): push out, reflect the inward normal velocity, then add
+  `BUMPER_KICK × power` outward; a hit flashes the rim. Movement is split into substeps no longer
+  than half the ball's radius (`substepCount`, at most 8) so the ball cannot tunnel through a
+  bumper, and the speed cap is re-applied after each kick.
+- **The layout persists** under `@pinbolita:layout` in table-width units
+  (`serializeLayout` / `parseLayout`: versioned, unknown part types skipped for later
+  deliverables, malformed bumpers dropped, the rest clamped onto the table). A blob that is not
+  a layout at all is copied to `@pinbolita:layout:corrupt` rather than overwritten.
 - **Options is cosmetic only** (sound, vibration, colours, pitch, volumes); **Debug is every
   value that changes play** (pull, lanes, cooldown, viscosity, bounciness, friction, touch-band
   overlay) plus the renderer-spike tools. All settings persist (`@pinbolita:settings`,
@@ -86,7 +107,8 @@ red/green/blue (and the refused strip black).
   functions (`laneAfterLaunch`, `laneTick`, `canSwipeCatch`, `laneRetention`, `laneVisual`),
   `mixColor`, `launchArrow`, `bandOf`, `hasFallenOut`, `bandEntryVelocity`, the camera
   (`cameraTarget`, `stepCamera`, `screenToWorld`, `panProgress`), `laneCooldownMs`,
-  `mergeSettings`, plus the engine's `frameScale`,
+  `mergeSettings`, `substepCount`, `collideCircle`, the build grid (`cellOf`, `cellCenter`,
+  `canPlace`), `serializeLayout`, `parseLayout`, plus the engine's `frameScale`,
   `impulseAwayFrom`, `capSpeed`, `impactGain`, `pickVariant`, `nextHue`, `frictionRetention`,
   `swipeLaunch`. New rules go here first, test-first.
 - **`App.tsx`** — everything that touches a device: `GameSystem` (the frame loop), the renderers,
@@ -94,7 +116,7 @@ red/green/blue (and the refused strip black).
 
 ### Module-scope mutable state is deliberate
 
-`settings`, `pendingImpulse`, `lanes`, `gameLost`, `camera`, `respawnPan` and the audio banks are module-level
+`settings`, `pendingImpulse`, `lanes`, `gameLost`, `camera`, `respawnPan`, `mode`, `layout`, `activeBumpers` and the audio banks are module-level
 singletons, not React state, because the frame loop and the touch responder run outside React's
 render cycle and need synchronous reads. Consequence: a **required dual write** — `updateSetting`
 writes both the module `settings` object and React state. Add a setting and update only one and

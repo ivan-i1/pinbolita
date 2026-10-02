@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
+  Alert,
   Animated,
   Dimensions,
   Modal,
@@ -23,7 +24,16 @@ import {
   bandEntryVelocity,
   bandOf,
   cameraTarget,
+  canPlace,
   canSwipeCatch,
+  capSpeed,
+  cellCenter,
+  cellOf,
+  collideCircle,
+  parseLayout,
+  serializeLayout,
+  substepCount,
+  type Bumper,
   catchFraction,
   frameScale,
   frictionRetention,
@@ -188,6 +198,22 @@ if (__DEV__ && LANE_DEPTH <= MAX_SPEED * 2 + BALL_SIZE) {
   console.warn('[lanes] lane band is shallower than one worst-case step');
 }
 
+// Creative: bumpers sit on the centres of a GRID_CELLS-wide grid, in table-width units, so
+// a layout fits any phone. Kick is the outward speed a bumper adds on contact, scaled by
+// the bumper's power.
+const GRID_CELLS = 8;
+const BUMPER_RADIUS_TW = 0.05;
+const BUMPER_KICK = 8 * SCALE;
+const POWER_CHOICES = [0.5, 1, 1.5, 2];
+const LAYOUT_STORAGE_KEY = '@pinbolita:layout';
+// Bumpers are small next to a stalled frame's 80 px step, so movement is split into
+// pieces no longer than half the ball's radius, at most MAX_SUBSTEPS per frame.
+const MAX_SUBSTEP = RADIUS * 0.5;
+const MAX_SUBSTEPS = 8;
+// The Creative tool strip down the right edge, where its buttons own every touch.
+const STRIP_WIDTH = 76;
+const BUMPER_FLASH_MS = 120;
+
 // Camera: the view is the screen below the status bar, scrolling down the table. The
 // ball is held ANCHOR of the way down the view, eased by FOLLOW per 60 Hz frame.
 const VIEWPORT_HEIGHT = SCREEN_HEIGHT - (StatusBar.currentHeight ?? 0);
@@ -269,6 +295,21 @@ const camera = { y: 0 };
 let respawnPan: { startedAt: number; from: number } | null = null;
 // Frame-rate estimate for the Debug FPS meter: an EMA of frame time.
 let frameMsAvg = 1000 / 60;
+
+// Which screen is up, mirrored from React state for the frame loop and the responder.
+// Game and Creative are independent modes (ADV-REV Q16); Test plays the Creative layout
+// and hands back to Creative on pause or loss.
+type Mode = 'menu' | 'game' | 'creative' | 'test';
+let mode: Mode = 'menu';
+// The Creative layout, in table-width units, and the bumpers the ball actually hits:
+// the layout during Test, nothing in Game (ADV-REV Q32, default: an empty table).
+let layout: Bumper[] = [];
+let activeBumpers: Bumper[] = [];
+// When each bumper was last hit, for a brief flash.
+const bumperHits: Record<string, number> = {};
+// The cell a Creative touch would act on, shown while the finger is down.
+const ghost = { visible: false, col: 0, row: 0, kind: 'place' as 'place' | 'remove' | 'blocked' };
+let nextBumperId = 0;
 // Set while a bottom-band swipe holds the ball still. `stopLane` launches it on release;
 // `aimFrom` is the drag already made when the stop began, so the shot is measured from
 // the moment the ball stopped, not from where the finger first landed.
@@ -416,10 +457,20 @@ const publish = (entities: any, now: number, here: { k: number; inBand: boolean 
   entities.arrow.visible = arrow.visible;
   entities.arrow.length = arrow.length;
   entities.arrow.angle = arrow.angle;
-  for (const key of ['guides', 'stress', 'lanes', 'box', 'arrow']) entities[key].camY = camera.y;
+  for (const key of ['guides', 'stress', 'lanes', 'box', 'arrow', 'bumpers', 'grid']) {
+    entities[key].camY = camera.y;
+  }
   entities.stress.count = settings.stressViews;
   entities.hud.fps = settings.showFps ? 1000 / frameMsAvg : 0;
   box.color = settings.colorOnBounce ? ballColor : BALL_DEFAULT_COLOR;
+  // Creative edits the layout with no ball; Test and Game play whatever is active.
+  const editing = mode === 'creative';
+  box.hidden = editing;
+  entities.bumpers.items = editing ? layout : activeBumpers;
+  entities.bumpers.hits = bumperHits;
+  entities.bumpers.now = now;
+  entities.grid.visible = editing;
+  entities.grid.ghost = editing && ghost.visible ? { ...ghost } : null;
 };
 
 const GameSystem = (entities: any, { time }: any) => {
@@ -436,6 +487,12 @@ const GameSystem = (entities: any, { time }: any) => {
 
   // Cooldowns run on the wall clock, so a lane recovers even while the ball is elsewhere.
   lanes = lanes.map((lane) => laneTick(lane, now));
+
+  // Creative: no ball, no physics. The camera is scrolled by hand; just draw.
+  if (mode === 'creative') {
+    publish(entities, now, { k: 0, inBand: false });
+    return entities;
+  }
 
   // Camera: pan back up after Continue, otherwise follow the ball down the table. It holds
   // still while the loss overlay is up.
@@ -472,13 +529,32 @@ const GameSystem = (entities: any, { time }: any) => {
   const retention = here.inBand
     ? laneRetention(lanes[here.k], settings.viscosity, COOLING_RETENTION)
     : frictionRetention(settings.friction, FRICTION_LOSS_AT_MAX);
-  const next = stepBall(
-    { x: box.position.x, y: box.position.y, vx: box.velocity.x, vy: box.velocity.y },
-    settings.pull * SCALE,
-    dtf,
-    retention,
-    MAX_SPEED,
-  );
+  // Integrate in pieces short enough that the ball cannot skip over a bumper, colliding
+  // after each one. Splitting dtf is exact for the pull and the damping (r^(dtf/n))^n.
+  let next = { x: box.position.x, y: box.position.y, vx: box.velocity.x, vy: box.velocity.y };
+  const pieces = substepCount(Math.hypot(next.vx, next.vy) * dtf, MAX_SUBSTEP, MAX_SUBSTEPS);
+  for (let s = 0; s < pieces; s++) {
+    next = stepBall(next, settings.pull * SCALE, dtf / pieces, retention, MAX_SPEED);
+    for (const bumper of activeBumpers) {
+      const contact = collideCircle(
+        next,
+        bumper.x * SCREEN_WIDTH,
+        bumper.y * SCREEN_WIDTH,
+        RADIUS + bumper.r * SCREEN_WIDTH,
+        BUMPER_KICK * bumper.power,
+      );
+      if (!contact.hit) continue;
+      next = contact.ball;
+      if (contact.impact > 0) {
+        bumperHits[bumper.id] = now;
+        triggerBounceFeedback(contact.impact);
+      }
+    }
+    // A kick can push past the cap; the cap holds everywhere.
+    const capped = capSpeed(next.vx, next.vy, MAX_SPEED);
+    next.vx = capped.x;
+    next.vy = capped.y;
+  }
   box.position.x = next.x;
   box.position.y = next.y;
   box.velocity.x = next.vx;
@@ -644,7 +720,103 @@ const LaunchArrow = ({ visible, x, y: worldY, length, angle, camY }: any) => {
   );
 };
 
-const Box = ({ position, size, color, camY }: any) => {
+// Bumpers, in table-width units, drawn at their place on the table. Stronger bumpers are
+// brighter and carry their power as a label; a hit flashes the rim for a moment.
+const BumperField = ({
+  items,
+  hits,
+  now,
+  camY,
+}: {
+  items: Bumper[];
+  hits: Record<string, number>;
+  now: number;
+  camY: number;
+}) => (
+  <View style={StyleSheet.absoluteFill} pointerEvents="none">
+    {(items ?? []).map((b) => {
+      const r = b.r * SCREEN_WIDTH;
+      const flashing = now - (hits?.[b.id] ?? -Infinity) < BUMPER_FLASH_MS;
+      return (
+        <View
+          key={b.id}
+          style={[
+            styles.bumper,
+            {
+              left: b.x * SCREEN_WIDTH - r,
+              top: toScreenY(b.y * SCREEN_WIDTH, camY ?? 0) - r,
+              width: 2 * r,
+              height: 2 * r,
+              borderRadius: r,
+              backgroundColor: mixColor('#5b2a86', '#c77dff', (b.power - 0.5) / 1.5),
+            },
+            flashing && styles.bumperFlash,
+          ]}
+        >
+          <Text style={styles.bumperLabel}>×{b.power}</Text>
+        </View>
+      );
+    })}
+  </View>
+);
+
+// Creative's build grid: cell lines, the no-build zones shaded (the spawn row and the lane
+// band), and the cell under the finger — green to place, orange to remove, red if blocked.
+const GRID_ROWS = TABLE_ASPECT * GRID_CELLS;
+const CELL = SCREEN_WIDTH / GRID_CELLS;
+const GHOST_COLORS = {
+  place: 'rgba(46,204,113,0.45)',
+  remove: 'rgba(255,152,0,0.5)',
+  blocked: 'rgba(231,76,60,0.45)',
+};
+const BuildGrid = ({
+  visible,
+  camY,
+  ghost: g,
+}: {
+  visible: boolean;
+  camY: number;
+  ghost: typeof ghost | null;
+}) => {
+  if (!visible) return null;
+  const cam = camY ?? 0;
+  const firstRow = Math.max(0, Math.floor(cam / CELL));
+  const lastRow = Math.min(GRID_ROWS, Math.ceil((cam + VIEWPORT_HEIGHT) / CELL));
+  return (
+    <View style={StyleSheet.absoluteFill} pointerEvents="none">
+      <View style={[styles.noBuild, { top: toScreenY(0, cam), height: CELL }]} />
+      <View
+        style={[styles.noBuild, { top: toScreenY(CATCH_EDGE_Y, cam), height: LANE_DEPTH }]}
+      />
+      {Array.from({ length: GRID_CELLS + 1 }, (_, i) => (
+        <View key={`c${i}`} style={[styles.gridCol, { left: i * CELL }]} />
+      ))}
+      {Array.from({ length: lastRow - firstRow + 1 }, (_, i) => (
+        <View
+          key={`r${firstRow + i}`}
+          style={[styles.gridRow, { top: toScreenY((firstRow + i) * CELL, cam) }]}
+        />
+      ))}
+      {g && (
+        <View
+          style={[
+            styles.ghost,
+            {
+              left: g.col * CELL,
+              top: toScreenY(g.row * CELL, cam),
+              width: CELL,
+              height: CELL,
+              backgroundColor: GHOST_COLORS[g.kind],
+            },
+          ]}
+        />
+      )}
+    </View>
+  );
+};
+
+const Box = ({ position, size, color, camY, hidden }: any) => {
+  if (hidden) return null;
   return (
     <View
       style={{
@@ -667,7 +839,7 @@ const Hud = ({ fps }: { fps: number }) =>
 // Built once, deliberately. GameEngine reads entities only at mount, and the root touch
 // responder needs a stable handle on the ball to work out which way "away from the tap"
 // is. Draw order follows key order: guides and stress views at the back, then the lanes,
-// the ball, the arrow, and the HUD on top.
+// the bumpers, the build grid, the ball, the arrow, and the HUD on top.
 const gameEntities = {
   guides: { camY: 0, renderer: <TableGuides camY={0} /> },
   stress: { count: 0, camY: 0, renderer: <StressViews count={0} camY={0} /> },
@@ -676,7 +848,21 @@ const gameEntities = {
     camY: 0,
     renderer: <LaneStrip visuals={[]} camY={0} />,
   },
+  bumpers: {
+    items: [] as Bumper[],
+    hits: bumperHits,
+    now: 0,
+    camY: 0,
+    renderer: <BumperField items={[]} hits={{}} now={0} camY={0} />,
+  },
+  grid: {
+    visible: false,
+    camY: 0,
+    ghost: null as typeof ghost | null,
+    renderer: <BuildGrid visible={false} camY={0} ghost={null} />,
+  },
   box: {
+    hidden: false,
     position: { x: SPAWN.x, y: SPAWN.y },
     velocity: { x: 0, y: 0 },
     size: [BALL_SIZE, BALL_SIZE],
@@ -694,6 +880,83 @@ const gameEntities = {
     renderer: <LaunchArrow />,
   },
   hud: { fps: 0, renderer: <Hud fps={0} /> },
+};
+
+// ---- Creative editing -------------------------------------------------------------
+// Touches on the table while editing: a vertical drag scrolls the view (ADV-REV Q16,
+// manual scroll); a tap places a bumper of the selected power in the cell under the
+// finger, or removes the one already there. The ghost shows the outcome while the finger
+// is down. Saved shortly after each change.
+
+let partPower = 1;
+const edit = { startCamera: 0, scrolling: false };
+let layoutSaveTimer: ReturnType<typeof setTimeout> | null = null;
+
+const saveLayout = () => {
+  if (layoutSaveTimer) clearTimeout(layoutSaveTimer);
+  layoutSaveTimer = setTimeout(() => {
+    const json = JSON.stringify(serializeLayout(layout, TABLE_ASPECT, GRID_CELLS));
+    AsyncStorage.setItem(LAYOUT_STORAGE_KEY, json).catch(() => {});
+  }, 400);
+};
+
+// The bumper occupying a cell, if any.
+const bumperAt = (col: number, row: number) => {
+  const c = cellCenter(col, row, GRID_CELLS);
+  return layout.find((b) => Math.hypot(b.x - c.x, b.y - c.y) < b.r);
+};
+
+const aimGhost = (pageX: number, pageY: number) => {
+  const p = screenToWorld(pageX, pageY, camera.y, TOP_INSET);
+  const { col, row } = cellOf(p.x / SCREEN_WIDTH, p.y / SCREEN_WIDTH, GRID_CELLS);
+  ghost.col = col;
+  ghost.row = row;
+  ghost.kind = bumperAt(col, row)
+    ? 'remove'
+    : canPlace(col, row, layout, GRID_CELLS, TABLE_ASPECT, LANE_DEPTH / SCREEN_WIDTH, BUMPER_RADIUS_TW)
+      ? 'place'
+      : 'blocked';
+  ghost.visible = true;
+};
+
+const beginEdit = (pageX: number, pageY: number) => {
+  edit.startCamera = camera.y;
+  edit.scrolling = false;
+  aimGhost(pageX, pageY);
+};
+
+const moveEdit = (dy: number) => {
+  if (!edit.scrolling && Math.abs(dy) <= SWIPE_CLAIM) return;
+  edit.scrolling = true;
+  ghost.visible = false;
+  camera.y = Math.max(0, Math.min(WORLD_HEIGHT - VIEWPORT_HEIGHT, edit.startCamera - dy));
+};
+
+const endEdit = () => {
+  const { col, row, kind, visible } = ghost;
+  ghost.visible = false;
+  if (edit.scrolling || !visible) return;
+  if (kind === 'remove') {
+    const target = bumperAt(col, row);
+    layout = layout.filter((b) => b !== target);
+  } else if (kind === 'place') {
+    const c = cellCenter(col, row, GRID_CELLS);
+    layout = [
+      ...layout,
+      {
+        id: `b${Date.now().toString(36)}${nextBumperId++}`,
+        type: 'bumper',
+        x: c.x,
+        y: c.y,
+        r: BUMPER_RADIUS_TW,
+        power: partPower,
+      },
+    ];
+  } else {
+    return;
+  }
+  if (settings.vibration) Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+  saveLayout();
 };
 
 type SettingsState = typeof DEFAULTS;
@@ -910,6 +1173,59 @@ const DebugMenu = ({
 
 // Each sound gets its own file picker and its own volume, so a loud custom bounce can be
 // tamed without turning the hit sound down with it.
+// Creative's part picker. Bumpers are the only part for now (ADV-REV Q3); later
+// deliverables add pads and destructible pieces here.
+const PartsMenu = ({
+  visible,
+  onClose,
+  power,
+  onPower,
+  count,
+  onClear,
+}: {
+  visible: boolean;
+  onClose: () => void;
+  power: number;
+  onPower: (p: number) => void;
+  count: number;
+  onClear: () => void;
+}) => (
+  <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
+    <View style={styles.modalBackdrop}>
+      <View style={styles.modalCard}>
+        <Text style={styles.modalTitle}>Parts</Text>
+        <View style={[styles.choiceRow, { marginBottom: 8 }]}>
+          <View style={[styles.choice, styles.choiceOn, { paddingHorizontal: 16 }]}>
+            <Text style={[styles.choiceText, styles.choiceTextOn]}>Bumper</Text>
+          </View>
+        </View>
+        <ChoiceRow
+          label="Power of new bumpers (×)"
+          choices={POWER_CHOICES}
+          value={power}
+          onPick={onPower}
+        />
+        <Text style={[styles.rowLabel, styles.muted, { marginTop: 12 }]}>
+          {count} bumper{count === 1 ? '' : 's'} on the table. Tap an empty cell to place one, tap
+          a bumper to remove it, drag to scroll.
+        </Text>
+        <View style={styles.modalActions}>
+          <TouchableOpacity
+            style={[styles.button, styles.secondaryButton]}
+            onPress={onClear}
+            disabled={count === 0}
+          >
+            <Text style={[styles.buttonText, styles.secondaryButtonText]}>Clear table</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.button} onPress={onClose}>
+            <Text style={styles.buttonText}>Done</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    </View>
+  </Modal>
+);
+
 const SoundRow = ({
   label,
   name,
@@ -1028,8 +1344,17 @@ export default function App() {
   const [customSoundName, setCustomSoundName] = useState<string | null>(null);
   const [customHitName, setCustomHitName] = useState<string | null>(null);
   const [lost, setLost] = useState(false);
-  // The app opens on the start menu (ADV-REV Q23); the table only runs in game mode.
-  const [screen, setScreen] = useState<'menu' | 'game'>('menu');
+  // The app opens on the start menu (ADV-REV Q23). Mirrored into the module `mode` for the
+  // frame loop and the responder.
+  const [screen, setScreen] = useState<Mode>('menu');
+  const [partsOpen, setPartsOpen] = useState(false);
+  const [power, setPower] = useState(partPower);
+  const [bumperCount, setBumperCount] = useState(0);
+  const go = (next: Mode) => {
+    mode = next;
+    menuRef.current = next === 'menu';
+    setScreen(next);
+  };
   // The responder is created once, so it reads the loss and the menu through refs.
   const lostRef = useRef(false);
   const menuRef = useRef(true);
@@ -1042,6 +1367,11 @@ export default function App() {
   // Pulling the bar down pauses the table; putting it away resumes it. Banked nudges are
   // dropped either way, so resuming never discharges a stored-up shove.
   const settleBar = (show: boolean) => {
+    // In Test, pausing hands back to Creative (ADV-REV Q16).
+    if (show && mode === 'test') {
+      exitTest();
+      return;
+    }
     barShown.current = show;
     pendingImpulse.x = 0;
     pendingImpulse.y = 0;
@@ -1066,6 +1396,14 @@ export default function App() {
       onStartShouldSetPanResponder: (evt) => {
         // While the loss overlay or the start menu is up, its buttons own every touch.
         if (lostRef.current || menuRef.current) return false;
+        // Creative: the tool strip's buttons own their touches; the rest is the table. The
+        // play bands do not apply while editing.
+        if (mode === 'creative') {
+          band.current = 'none';
+          if (evt.nativeEvent.pageX > SCREEN_WIDTH - STRIP_WIDTH) return false;
+          beginEdit(evt.nativeEvent.pageX, evt.nativeEvent.pageY);
+          return true;
+        }
         band.current = bandOf(
           evt.nativeEvent.pageY,
           SCREEN_HEIGHT,
@@ -1084,10 +1422,15 @@ export default function App() {
       onMoveShouldSetPanResponder: (_evt, g) =>
         !lostRef.current &&
         !menuRef.current &&
+        mode !== 'creative' &&
         band.current === 'top' &&
         Math.abs(g.dy) > SWIPE_CLAIM &&
         Math.abs(g.dy) > Math.abs(g.dx),
       onPanResponderMove: (_evt, g) => {
+        if (mode === 'creative') {
+          moveEdit(g.dy);
+          return;
+        }
         if (band.current === 'bottom') {
           // A drag already under way also stops a ball that sinks into reach mid-swipe;
           // the shot is then measured from that moment.
@@ -1117,6 +1460,12 @@ export default function App() {
       },
       onPanResponderRelease: (evt, g) => {
         const box = gameEntities.box;
+
+        if (mode === 'creative') {
+          endEdit();
+          setBumperCount(layout.length);
+          return;
+        }
 
         if (band.current === 'top') {
           if (g.dy > SWIPE_TRIGGER) settleBar(true);
@@ -1175,8 +1524,9 @@ export default function App() {
         playPushSound();
       },
       onPanResponderTerminate: () => {
-        // Losing the touch to the system must never leave the ball stopped.
+        // Losing the touch to the system must never leave the ball stopped, or a ghost up.
         releaseStop();
+        ghost.visible = false;
         if (band.current === 'top') settleBar(barShown.current);
       },
     }),
@@ -1207,15 +1557,82 @@ export default function App() {
     respawnPan = { startedAt: Date.now(), from: camera.y };
   };
 
-  // From the start menu: a fresh table, viewed from the top.
+  // Put the pause bar away without the pause/resume side effects.
+  const hideBar = () => {
+    barShown.current = false;
+    barY.setValue(-BAR_HIDDEN_Y);
+  };
+
+  // From the start menu: a fresh, empty table viewed from the top (ADV-REV Q32 default).
   const startGame = () => {
     resetTable();
+    activeBumpers = [];
     respawnPan = null;
     camera.y = 0;
-    menuRef.current = false;
-    setScreen('game');
+    hideBar();
+    go('game');
     setRunning(true);
   };
+
+  // Creative: no ball; the layout under a build grid, scrolled by hand from the top.
+  const enterCreative = () => {
+    resetTable();
+    activeBumpers = [];
+    respawnPan = null;
+    camera.y = 0;
+    ghost.visible = false;
+    hideBar();
+    setBumperCount(layout.length);
+    go('creative');
+    setRunning(true);
+  };
+
+  // Test plays the layout, then hands back to Creative on pause or loss (ADV-REV Q16).
+  const startTest = () => {
+    resetTable();
+    activeBumpers = [...layout];
+    respawnPan = null;
+    camera.y = 0;
+    hideBar();
+    go('test');
+    setRunning(true);
+  };
+
+  const exitTest = () => {
+    resetTable();
+    activeBumpers = [];
+    hideBar();
+    go('creative');
+    setRunning(true);
+  };
+
+  const backToMenu = () => {
+    resetTable();
+    activeBumpers = [];
+    ghost.visible = false;
+    hideBar();
+    go('menu');
+    setRunning(true);
+  };
+
+  const choosePower = (p: number) => {
+    partPower = p;
+    setPower(p);
+  };
+
+  const clearTable = () =>
+    Alert.alert('Clear the table?', 'This removes every bumper. It cannot be undone.', [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Clear',
+        style: 'destructive',
+        onPress: () => {
+          layout = [];
+          setBumperCount(0);
+          saveLayout();
+        },
+      },
+    ]);
 
   useEffect(() => {
     // Sound effects should survive the iOS silent switch, and should sit alongside
@@ -1246,7 +1663,31 @@ export default function App() {
         lanes = freshLanes();
       })
       .catch(() => {});
+    // Restore the Creative layout. A blob that is not a layout at all is someone's table in
+    // a shape this build cannot read: keep a copy aside rather than overwrite it.
+    AsyncStorage.getItem(LAYOUT_STORAGE_KEY)
+      .then((raw) => {
+        if (!raw) return;
+        let parsed: unknown = null;
+        try {
+          parsed = JSON.parse(raw);
+        } catch {}
+        const result = parseLayout(parsed, TABLE_ASPECT);
+        if (!result.valid) {
+          AsyncStorage.setItem(`${LAYOUT_STORAGE_KEY}:corrupt`, raw).catch(() => {});
+          return;
+        }
+        layout = result.items;
+        setBumperCount(layout.length);
+      })
+      .catch(() => {});
+
+    // Losing in Test hands straight back to Creative; in Game it raises the overlay.
     notifyLost = () => {
+      if (mode === 'test') {
+        exitTest();
+        return;
+      }
       lostRef.current = true;
       setLost(true);
     };
@@ -1400,9 +1841,9 @@ export default function App() {
         style={styles.gameContainer}
         systems={[GameSystem]}
         entities={gameEntities}
-        running={running && screen === 'game'}
+        running={running && screen !== 'menu'}
       >
-        {state.debugBands && (
+        {state.debugBands && (screen === 'game' || screen === 'test') && (
           <View style={StyleSheet.absoluteFill} pointerEvents="none">
             <View style={[styles.debugBand, { height: SCREEN_HEIGHT * TOP_BAND, backgroundColor: 'rgba(255,0,0,0.22)' }]} />
             <View style={[styles.debugBand, { flex: 1, backgroundColor: 'rgba(0,255,0,0.14)' }]} />
@@ -1421,10 +1862,14 @@ export default function App() {
           Clipped below the status bar, so the hidden bar never shows through the system's
           transparent status area. box-none keeps the playfield under it touchable.
         */}
-        {screen === 'game' && (
+        {(screen === 'game' || screen === 'test') && (
         <View style={styles.controls} pointerEvents="box-none">
           <Animated.View style={[styles.topBar, { transform: [{ translateY: barY }] }]}>
-            {/* In game: Resume, Options, Debug (ADV-REV Q23). */}
+            {/*
+              In game: Resume, Options, Debug (ADV-REV Q23), plus Menu — Game and Creative
+              are separate modes, and without it there is no way from one to the other.
+              In Test, pulling the bar down hands straight back to Creative instead.
+            */}
             <View style={styles.buttonRow}>
               <TouchableOpacity style={[styles.button, styles.barButton]} onPress={() => settleBar(false)}>
                 <Text style={styles.buttonText}>Resume</Text>
@@ -1440,6 +1885,12 @@ export default function App() {
                 onPress={() => setDebugOpen(true)}
               >
                 <Text style={[styles.buttonText, styles.secondaryButtonText]}>Debug</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.button, styles.barButton, styles.secondaryButton]}
+                onPress={backToMenu}
+              >
+                <Text style={[styles.buttonText, styles.secondaryButtonText]}>Menu</Text>
               </TouchableOpacity>
             </View>
             {/*
@@ -1472,15 +1923,9 @@ export default function App() {
             <TouchableOpacity style={[styles.button, styles.menuButton]} onPress={startGame}>
               <Text style={[styles.buttonText, styles.menuButtonText]}>Game</Text>
             </TouchableOpacity>
-            {/* Creative arrives in 1c; shown now so the menu has its final shape. */}
-            <View
-              style={[styles.button, styles.menuButton, styles.menuButtonDisabled]}
-              accessibilityState={{ disabled: true }}
-            >
-              <Text style={[styles.buttonText, styles.menuButtonText, styles.menuDisabledText]}>
-                Creative · soon
-              </Text>
-            </View>
+            <TouchableOpacity style={[styles.button, styles.menuButton]} onPress={enterCreative}>
+              <Text style={[styles.buttonText, styles.menuButtonText]}>Creative</Text>
+            </TouchableOpacity>
             <TouchableOpacity
               style={[styles.button, styles.menuButton, styles.secondaryButton]}
               onPress={() => setMenuOpen(true)}
@@ -1499,7 +1944,49 @@ export default function App() {
             </TouchableOpacity>
           </View>
         )}
+
+        {screen === 'creative' && (
+          <>
+            {/* The grid already signals the mode; the badge names it. */}
+            <Text style={styles.creativeBadge} pointerEvents="none">
+              CREATIVE · {bumperCount}
+            </Text>
+            {/* The right-side tool strip (ADV-REV Q3, Q23): Parts, Debug, Test, plus Menu. */}
+            <View style={styles.strip}>
+              <TouchableOpacity style={styles.stripPart} onPress={() => setPartsOpen(true)}>
+                <View
+                  style={[
+                    styles.stripPartDot,
+                    { backgroundColor: mixColor('#5b2a86', '#c77dff', (power - 0.5) / 1.5) },
+                  ]}
+                />
+                <Text style={styles.stripPartText}>×{power}</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.stripButton} onPress={() => setPartsOpen(true)}>
+                <Text style={styles.stripButtonText}>Parts</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.stripButton} onPress={() => setDebugOpen(true)}>
+                <Text style={styles.stripButtonText}>Debug</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.stripButton} onPress={startTest}>
+                <Text style={styles.stripButtonText}>Test</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.stripButton} onPress={backToMenu}>
+                <Text style={styles.stripButtonText}>Menu</Text>
+              </TouchableOpacity>
+            </View>
+          </>
+        )}
       </GameEngine>
+
+      <PartsMenu
+        visible={partsOpen}
+        onClose={() => setPartsOpen(false)}
+        power={power}
+        onPower={choosePower}
+        count={bumperCount}
+        onClear={clearTable}
+      />
 
       <OptionsMenu
         visible={menuOpen}
@@ -1583,6 +2070,98 @@ const styles = StyleSheet.create({
     borderTopWidth: 2,
     borderTopColor: 'rgba(3,218,198,0.6)',
   },
+  bumper: {
+    position: 'absolute',
+    borderWidth: 2,
+    borderColor: 'rgba(255,255,255,0.35)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  bumperFlash: {
+    borderColor: 'white',
+    borderWidth: 4,
+  },
+  bumperLabel: {
+    color: 'white',
+    fontSize: 10,
+    fontWeight: 'bold',
+  },
+  noBuild: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    backgroundColor: 'rgba(231,76,60,0.12)',
+  },
+  gridCol: {
+    position: 'absolute',
+    top: 0,
+    bottom: 0,
+    width: 1,
+    backgroundColor: 'rgba(255,255,255,0.08)',
+  },
+  gridRow: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    height: 1,
+    backgroundColor: 'rgba(255,255,255,0.08)',
+  },
+  ghost: {
+    position: 'absolute',
+    borderRadius: 6,
+  },
+  strip: {
+    position: 'absolute',
+    top: TOP_INSET + 8,
+    right: 6,
+    width: STRIP_WIDTH - 12,
+    gap: 8,
+    alignItems: 'stretch',
+  },
+  stripButton: {
+    backgroundColor: 'rgba(30,30,30,0.92)',
+    borderWidth: 1,
+    borderColor: '#03dac6',
+    borderRadius: 12,
+    paddingVertical: 10,
+    alignItems: 'center',
+  },
+  stripButtonText: {
+    color: '#03dac6',
+    fontSize: 13,
+    fontWeight: 'bold',
+  },
+  stripPart: {
+    alignItems: 'center',
+    paddingVertical: 6,
+    borderRadius: 12,
+    backgroundColor: 'rgba(30,30,30,0.92)',
+  },
+  stripPartDot: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    borderWidth: 2,
+    borderColor: 'rgba(255,255,255,0.35)',
+  },
+  stripPartText: {
+    color: 'white',
+    fontSize: 11,
+    marginTop: 4,
+  },
+  creativeBadge: {
+    position: 'absolute',
+    top: TOP_INSET + 8,
+    left: 10,
+    color: '#03dac6',
+    fontSize: 13,
+    fontWeight: 'bold',
+    backgroundColor: 'rgba(18,18,18,0.8)',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 8,
+    overflow: 'hidden',
+  },
   statusBackdrop: {
     position: 'absolute',
     top: 0,
@@ -1647,8 +2226,9 @@ const styles = StyleSheet.create({
   choiceTextOn: {
     color: 'black',
   },
+  // Four buttons must fit a 360 dp bar.
   barButton: {
-    paddingHorizontal: 14,
+    paddingHorizontal: 10,
   },
   startMenu: {
     ...StyleSheet.absoluteFillObject,

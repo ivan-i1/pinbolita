@@ -430,3 +430,137 @@ export function mergeSettings<T extends Record<string, number | boolean>>(
   }
   return out;
 }
+
+/**
+ * How many pieces to split a frame's movement into, so no piece is longer than `maxStep`.
+ *
+ * Bumpers are small and the ball can move 80 px in a stalled frame: integrated in one
+ * piece it can jump clean over a bumper, or land past its centre and be pushed out the
+ * far side. Capped, because a pathological frame should cost bounded work.
+ */
+export function substepCount(travel: number, maxStep: number, maxSubsteps: number): number {
+  if (!(travel > 0) || !(maxStep > 0)) return 1;
+  return clamp(Math.ceil(travel / maxStep), 1, maxSubsteps);
+}
+
+/**
+ * Ball against a round bumper.
+ *
+ * If they overlap, the ball is pushed out to touching distance along the line between the
+ * centres. If it was moving in, its normal velocity is reflected and the bumper adds
+ * `kick` outward — the bumper gives energy back, which is what makes it a bumper rather
+ * than a post. A ball already moving away is only separated. `impact` is the inward
+ * normal speed, for sound and haptics.
+ */
+export function collideCircle(
+  ball: Ball,
+  cx: number,
+  cy: number,
+  radiusSum: number,
+  kick: number,
+): { ball: Ball; hit: boolean; impact: number } {
+  const dx = ball.x - cx;
+  const dy = ball.y - cy;
+  const distance = Math.hypot(dx, dy);
+  if (distance >= radiusSum) return { ball, hit: false, impact: 0 };
+
+  // Dead centre has no direction: push straight up, out of the way of the pull.
+  const nx = distance > 1e-9 ? dx / distance : 0;
+  const ny = distance > 1e-9 ? dy / distance : -1;
+  const x = cx + nx * radiusSum;
+  const y = cy + ny * radiusSum;
+
+  const vn = ball.vx * nx + ball.vy * ny;
+  if (vn >= 0) return { ball: { x, y, vx: ball.vx, vy: ball.vy }, hit: true, impact: 0 };
+
+  return {
+    ball: {
+      x,
+      y,
+      vx: ball.vx - 2 * vn * nx + kick * nx,
+      vy: ball.vy - 2 * vn * ny + kick * ny,
+    },
+    hit: true,
+    impact: -vn,
+  };
+}
+
+/** The grid cell under a point, in table-width units. Columns are clamped to the table. */
+export function cellOf(x: number, y: number, cells: number): { col: number; row: number } {
+  return { col: clamp(Math.floor(x * cells), 0, cells - 1), row: Math.floor(y * cells) };
+}
+
+/** Centre of a grid cell, in table-width units. */
+export function cellCenter(col: number, row: number, cells: number): Vec {
+  return { x: (col + 0.5) / cells, y: (row + 0.5) / cells };
+}
+
+export type Bumper = { id: string; type: 'bumper'; x: number; y: number; r: number; power: number };
+
+/**
+ * Whether a bumper of radius `r` may go in this cell: on the grid, off the spawn row, clear
+ * of the lane band (a bumper there would sit in the flippers), and not overlapping another.
+ */
+export function canPlace(
+  col: number,
+  row: number,
+  items: Bumper[],
+  cells: number,
+  aspect: number,
+  laneDepth: number,
+  r: number,
+): boolean {
+  if (col < 0 || col >= cells || row < 1 || row >= aspect * cells) return false;
+  const c = cellCenter(col, row, cells);
+  if (c.y + r > aspect - laneDepth) return false;
+  return items.every((it) => Math.hypot(it.x - c.x, it.y - c.y) >= it.r + r - 1e-9);
+}
+
+export type Layout = {
+  v: 1;
+  units: 'tw';
+  aspect: number;
+  grid: number;
+  items: Bumper[];
+};
+
+/** The persisted form of a table. Positions are table-width units, so it fits any phone. */
+export function serializeLayout(items: Bumper[], aspect: number, grid: number): Layout {
+  return { v: 1, units: 'tw', aspect, grid, items };
+}
+
+/**
+ * Read a stored layout, trusting nothing.
+ *
+ * `valid: false` means the blob is not a v1 layout at all — the caller should keep it aside
+ * rather than overwrite it, because it is someone's hand-built table. Inside a valid
+ * layout, unknown part types are skipped (later deliverables add pads and more),
+ * malformed bumpers are dropped, the rest are clamped onto the table, and duplicate ids
+ * keep the first.
+ */
+export function parseLayout(raw: unknown, aspect: number): { valid: boolean; items: Bumper[] } {
+  if (raw === null || typeof raw !== 'object') return { valid: false, items: [] };
+  const layout = raw as Record<string, unknown>;
+  if (layout.v !== 1 || !Array.isArray(layout.items)) return { valid: false, items: [] };
+
+  const items: Bumper[] = [];
+  const seen = new Set<string>();
+  for (const entry of layout.items) {
+    if (entry === null || typeof entry !== 'object') continue;
+    const e = entry as Record<string, unknown>;
+    if (e.type !== 'bumper' || typeof e.id !== 'string' || seen.has(e.id)) continue;
+    const nums = [e.x, e.y, e.r, e.power];
+    if (!nums.every((n) => typeof n === 'number' && Number.isFinite(n))) continue;
+    const r = clamp(e.r as number, 0.02, 0.2);
+    items.push({
+      id: e.id,
+      type: 'bumper',
+      x: clamp(e.x as number, r, 1 - r),
+      y: clamp(e.y as number, r, aspect - r),
+      r,
+      power: clamp(e.power as number, 0.5, 2),
+    });
+    seen.add(e.id);
+  }
+  return { valid: true, items };
+}
