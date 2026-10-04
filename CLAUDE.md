@@ -26,7 +26,10 @@ be verified on a device or emulator. Say what you actually ran.
 
 ## The game (deliverables 1a + 1b + 1c)
 
-- The app opens on a **start menu**: Game, Creative, Options, Debug. In game, pulling the top bar
+- The app opens on a **start menu**: Game, Creative, Options, Debug. Its background is the
+  portrait art (`assets/menu-background.jpg`) under a scrim: Android 12+ draws the native
+  splash only as a small circle-cropped icon (`assets/splash-icon.png` on `#1c2428`), so the
+  full-screen art lives on the first screen instead. In game, pulling the top bar
   down pauses and offers Resume, Options, Debug, Menu. Game and Creative are **independent
   modes**; Game plays an empty table (ADV-REV Q32, default — only Test plays the layout). Menu
   on the bar and the Creative strip is beyond the spec's lists: without it, there was no way

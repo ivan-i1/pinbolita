@@ -3,6 +3,7 @@ import {
   Alert,
   Animated,
   Dimensions,
+  ImageBackground,
   Modal,
   PanResponder,
   ScrollView,
@@ -1918,7 +1919,15 @@ export default function App() {
         )}
 
         {screen === 'menu' && (
-          <View style={styles.startMenu}>
+          // Android 12+ shows the native splash only as a small centred icon, so the full
+          // portrait art lives here, on the first screen, under a scrim that keeps the buttons
+          // readable.
+          <ImageBackground
+            source={require('./assets/menu-background.jpg')}
+            resizeMode="cover"
+            style={styles.startMenu}
+          >
+            <View style={styles.startScrim} pointerEvents="none" />
             <Text style={styles.startTitle}>Pinbolita</Text>
             <TouchableOpacity style={[styles.button, styles.menuButton]} onPress={startGame}>
               <Text style={[styles.buttonText, styles.menuButtonText]}>Game</Text>
@@ -1942,7 +1951,7 @@ export default function App() {
                 Debug
               </Text>
             </TouchableOpacity>
-          </View>
+          </ImageBackground>
         )}
 
         {screen === 'creative' && (
@@ -2232,16 +2241,22 @@ const styles = StyleSheet.create({
   },
   startMenu: {
     ...StyleSheet.absoluteFillObject,
-    backgroundColor: 'rgba(18,18,18,0.92)',
+    backgroundColor: '#1c2428',
     alignItems: 'center',
     justifyContent: 'center',
     gap: 16,
+  },
+  startScrim: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(0,0,0,0.45)',
   },
   startTitle: {
     color: 'white',
     fontSize: 44,
     fontWeight: 'bold',
     marginBottom: 24,
+    textShadowColor: 'black',
+    textShadowRadius: 8,
   },
   menuButton: {
     width: 220,
