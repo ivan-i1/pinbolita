@@ -11,6 +11,7 @@ import {
   StyleSheet,
   Switch,
   Text,
+  TextInput,
   TouchableOpacity,
   View,
 } from 'react-native';
@@ -33,6 +34,12 @@ import {
   collideShape,
   partShape,
   PART_TYPES,
+  cleanTableName,
+  deleteTable,
+  parseTables,
+  saveTable,
+  serializeTables,
+  type SavedTable,
   parseLayout,
   serializeLayout,
   substepCount,
@@ -211,6 +218,10 @@ const BAR_HALF_TW = 0.014;
 const BUMPER_KICK = 8 * SCALE;
 const POWER_CHOICES = [0.5, 1, 1.5, 2];
 const LAYOUT_STORAGE_KEY = '@pinbolita:layout';
+// Named tables saved from Creative, and which of them the draft was loaded from or saved
+// as (so Save offers that name again).
+const TABLES_STORAGE_KEY = '@pinbolita:tables';
+const DRAFT_META_STORAGE_KEY = '@pinbolita:draft-meta';
 // Bumpers are small next to a stalled frame's 80 px step, so movement is split into
 // pieces no longer than half the ball's radius, at most MAX_SUBSTEPS per frame.
 const MAX_SUBSTEP = RADIUS * 0.5;
@@ -956,6 +967,17 @@ const edit = { startCamera: 0, scrolling: false };
 // the strip is away, every cell is reachable, and a tap places or removes a part.
 let building = false;
 let layoutSaveTimer: ReturnType<typeof setTimeout> | null = null;
+let tables: SavedTable[] = [];
+let draftName: string | null = null;
+
+const persistTables = () =>
+  AsyncStorage.setItem(
+    TABLES_STORAGE_KEY,
+    JSON.stringify(serializeTables(tables, TABLE_ASPECT, GRID_CELLS)),
+  ).catch(() => {});
+const persistDraftMeta = () =>
+  AsyncStorage.setItem(DRAFT_META_STORAGE_KEY, JSON.stringify({ name: draftName })).catch(() => {});
+const newTableId = () => `t${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`;
 
 const saveLayout = () => {
   if (layoutSaveTimer) clearTimeout(layoutSaveTimer);
@@ -1313,6 +1335,145 @@ const PartsMenu = ({
   </Modal>
 );
 
+// Creative's table library: save the table being edited under a name, load or delete a
+// saved one, or start a new one. Saving under a name that exists asks before overwriting.
+const TablesMenu = ({
+  visible,
+  onClose,
+  list,
+  currentName,
+  partCount,
+  onSave,
+  onLoad,
+  onDelete,
+  onNew,
+}: {
+  visible: boolean;
+  onClose: () => void;
+  list: SavedTable[];
+  currentName: string | null;
+  partCount: number;
+  onSave: (name: string) => void;
+  onLoad: (t: SavedTable) => void;
+  onDelete: (t: SavedTable) => void;
+  onNew: () => void;
+}) => {
+  const [name, setName] = useState(currentName ?? '');
+  useEffect(() => {
+    if (visible) setName(currentName ?? '');
+  }, [visible, currentName]);
+  return (
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
+      <View style={styles.modalBackdrop}>
+        <View style={styles.modalCard}>
+          <Text style={styles.modalTitle}>Tables</Text>
+          <Text style={[styles.rowLabel, styles.muted]}>
+            Editing: {currentName ?? 'unsaved table'} · {partCount} part{partCount === 1 ? '' : 's'}
+          </Text>
+          <View style={styles.saveRow}>
+            <TextInput
+              style={styles.nameInput}
+              value={name}
+              onChangeText={setName}
+              placeholder="Table name"
+              placeholderTextColor="#777"
+              maxLength={24}
+              returnKeyType="done"
+              onSubmitEditing={() => onSave(name)}
+            />
+            <TouchableOpacity style={[styles.button, styles.smallButton]} onPress={() => onSave(name)}>
+              <Text style={styles.buttonText}>Save</Text>
+            </TouchableOpacity>
+          </View>
+          <Text style={styles.sectionLabel}>Saved</Text>
+          <ScrollView style={styles.modalScroll} contentContainerStyle={styles.modalScrollContent}>
+            {list.length === 0 && (
+              <Text style={[styles.rowLabel, styles.muted]}>No saved tables yet.</Text>
+            )}
+            {list.map((t) => (
+              <View key={t.id} style={styles.tableRow}>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.rowLabel} numberOfLines={1}>{t.name}</Text>
+                  <Text style={[styles.tableMeta, styles.muted]}>
+                    {t.items.length} part{t.items.length === 1 ? '' : 's'}
+                    {t.background ? ' · background' : ''}
+                  </Text>
+                </View>
+                <TouchableOpacity style={[styles.button, styles.smallButton]} onPress={() => onLoad(t)}>
+                  <Text style={styles.buttonText}>Load</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.button, styles.smallButton, styles.secondaryButton]}
+                  onPress={() => onDelete(t)}
+                  accessibilityLabel={`Delete ${t.name}`}
+                >
+                  <Text style={[styles.buttonText, styles.secondaryButtonText]}>✕</Text>
+                </TouchableOpacity>
+              </View>
+            ))}
+          </ScrollView>
+          <View style={styles.modalActions}>
+            <TouchableOpacity style={[styles.button, styles.secondaryButton]} onPress={onNew}>
+              <Text style={[styles.buttonText, styles.secondaryButtonText]}>New table</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.button} onPress={onClose}>
+              <Text style={styles.buttonText}>Done</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </View>
+    </Modal>
+  );
+};
+
+// Game: which table to play — an empty one, or any table saved from Creative.
+const GamePicker = ({
+  visible,
+  onClose,
+  list,
+  onPick,
+}: {
+  visible: boolean;
+  onClose: () => void;
+  list: SavedTable[];
+  onPick: (t: SavedTable | null) => void;
+}) => (
+  <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
+    <View style={styles.modalBackdrop}>
+      <View style={styles.modalCard}>
+        <Text style={styles.modalTitle}>Play which table?</Text>
+        <ScrollView style={styles.modalScroll} contentContainerStyle={styles.modalScrollContent}>
+          <TouchableOpacity style={styles.pickRow} onPress={() => onPick(null)}>
+            <Text style={styles.rowLabel}>Empty table</Text>
+            <Text style={styles.subMenuChevron}>›</Text>
+          </TouchableOpacity>
+          {list.map((t) => (
+            <TouchableOpacity key={t.id} style={styles.pickRow} onPress={() => onPick(t)}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.rowLabel} numberOfLines={1}>{t.name}</Text>
+                <Text style={[styles.tableMeta, styles.muted]}>
+                  {t.items.length} part{t.items.length === 1 ? '' : 's'}
+                </Text>
+              </View>
+              <Text style={styles.subMenuChevron}>›</Text>
+            </TouchableOpacity>
+          ))}
+          {list.length === 0 && (
+            <Text style={[styles.rowLabel, styles.muted, { marginTop: 8 }]}>
+              Tables you save in Creative appear here.
+            </Text>
+          )}
+        </ScrollView>
+        <View style={styles.modalActions}>
+          <TouchableOpacity style={[styles.button, styles.secondaryButton]} onPress={onClose}>
+            <Text style={[styles.buttonText, styles.secondaryButtonText]}>Cancel</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    </View>
+  </Modal>
+);
+
 const SoundRow = ({
   label,
   name,
@@ -1438,6 +1599,10 @@ export default function App() {
   const [power, setPower] = useState(partPower);
   const [kind, setKind] = useState<PartType>(partType);
   const [buildingUi, setBuildingUi] = useState(false);
+  const [tablesOpen, setTablesOpen] = useState(false);
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [tableList, setTableList] = useState<SavedTable[]>([]);
+  const [draftNameUi, setDraftNameUi] = useState<string | null>(null);
   const [bumperCount, setBumperCount] = useState(0);
   const go = (next: Mode) => {
     mode = next;
@@ -1655,10 +1820,12 @@ export default function App() {
     barY.setValue(-BAR_HIDDEN_Y);
   };
 
-  // From the start menu: a fresh, empty table viewed from the top (ADV-REV Q32 default).
-  const startGame = () => {
+  // From the start menu's picker: an empty table, or one saved from Creative, viewed from
+  // the top.
+  const startGame = (table: SavedTable | null) => {
+    setPickerOpen(false);
     resetTable();
-    setActiveParts([]);
+    setActiveParts(table ? [...table.items] : []);
     respawnPan = null;
     camera.y = 0;
     hideBar();
@@ -1725,7 +1892,7 @@ export default function App() {
   };
 
   const clearTable = () =>
-    Alert.alert('Clear the table?', 'This removes every bumper. It cannot be undone.', [
+    Alert.alert('Clear the table?', 'This removes every part. It cannot be undone.', [
       { text: 'Cancel', style: 'cancel' },
       {
         text: 'Clear',
@@ -1734,6 +1901,88 @@ export default function App() {
           layout = [];
           setBumperCount(0);
           saveLayout();
+        },
+      },
+    ]);
+
+  // ---- Saved tables ----------------------------------------------------------------
+  const setDraftName = (name: string | null) => {
+    draftName = name;
+    setDraftNameUi(name);
+    persistDraftMeta();
+  };
+
+  const commitSave = (name: string) => {
+    const result = saveTable(tables, { name, items: [...layout], background: null }, Date.now(), newTableId);
+    tables = result.tables;
+    setTableList(tables);
+    persistTables();
+    setDraftName(name);
+    if (settings.vibration) Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+  };
+
+  const saveCurrent = (raw: string) => {
+    const name = cleanTableName(raw);
+    if (!name) {
+      Alert.alert('Name the table', 'Type a name to save it under.');
+      return;
+    }
+    const clash = tables.find((t) => t.name.toLowerCase() === name.toLowerCase());
+    // Re-saving the table you loaded is the normal case; replacing a different one asks.
+    if (clash && clash.name.toLowerCase() !== (draftName ?? '').toLowerCase()) {
+      Alert.alert(`Replace “${clash.name}”?`, 'A saved table already has this name.', [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Replace', style: 'destructive', onPress: () => commitSave(name) },
+      ]);
+      return;
+    }
+    commitSave(name);
+  };
+
+  const loadSaved = (t: SavedTable) => {
+    const apply = () => {
+      layout = [...t.items];
+      setBumperCount(layout.length);
+      saveLayout();
+      setDraftName(t.name);
+      setTablesOpen(false);
+    };
+    if (layout.length === 0) {
+      apply();
+      return;
+    }
+    Alert.alert(`Load “${t.name}”?`, 'It replaces the table you are editing. Save that first if you want to keep it.', [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Load', onPress: apply },
+    ]);
+  };
+
+  const deleteSaved = (t: SavedTable) =>
+    Alert.alert(`Delete “${t.name}”?`, 'This cannot be undone.', [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Delete',
+        style: 'destructive',
+        onPress: () => {
+          tables = deleteTable(tables, t.id);
+          setTableList(tables);
+          persistTables();
+        },
+      },
+    ]);
+
+  const newDraft = () =>
+    Alert.alert('Start a new table?', 'The table you are editing is cleared. Save it first if you want to keep it.', [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'New table',
+        style: 'destructive',
+        onPress: () => {
+          layout = [];
+          setBumperCount(0);
+          saveLayout();
+          setDraftName(null);
+          setTablesOpen(false);
         },
       },
     ]);
@@ -1782,6 +2031,26 @@ export default function App() {
         }
         layout = result.items;
         setBumperCount(layout.length);
+      })
+      .catch(() => {});
+    AsyncStorage.getItem(TABLES_STORAGE_KEY)
+      .then((raw) => {
+        if (!raw) return;
+        let parsed: unknown = null;
+        try {
+          parsed = JSON.parse(raw);
+        } catch {}
+        tables = parseTables(parsed, TABLE_ASPECT);
+        setTableList(tables);
+      })
+      .catch(() => {});
+    AsyncStorage.getItem(DRAFT_META_STORAGE_KEY)
+      .then((raw) => {
+        if (!raw) return;
+        const meta = JSON.parse(raw);
+        const name = typeof meta?.name === 'string' ? cleanTableName(meta.name) : null;
+        draftName = name;
+        setDraftNameUi(name);
       })
       .catch(() => {});
 
@@ -2031,7 +2300,7 @@ export default function App() {
           >
             <View style={styles.startScrim} pointerEvents="none" />
             <Text style={styles.startTitle}>Pinbolita</Text>
-            <TouchableOpacity style={[styles.button, styles.menuButton]} onPress={startGame}>
+            <TouchableOpacity style={[styles.button, styles.menuButton]} onPress={() => setPickerOpen(true)}>
               <Text style={[styles.buttonText, styles.menuButtonText]}>Game</Text>
             </TouchableOpacity>
             <TouchableOpacity style={[styles.button, styles.menuButton]} onPress={enterCreative}>
@@ -2060,7 +2329,7 @@ export default function App() {
           <>
             {/* The grid already signals the mode; the badge names it. */}
             <Text style={styles.creativeBadge} pointerEvents="none">
-              CREATIVE · {bumperCount}
+              CREATIVE · {draftNameUi ?? 'unsaved'} · {bumperCount}
             </Text>
             {buildingUi ? (
               // Building: the whole width is the grid. This bar is the way back out.
@@ -2088,6 +2357,9 @@ export default function App() {
                   onPress={() => setBuild(true)}
                 >
                   <Text style={[styles.stripButtonText, styles.stripPrimaryText]}>Build</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={styles.stripButton} onPress={() => setTablesOpen(true)}>
+                  <Text style={styles.stripButtonText}>Tables</Text>
                 </TouchableOpacity>
                 <TouchableOpacity style={styles.stripButton} onPress={startTest}>
                   <Text style={styles.stripButtonText}>Test</Text>
@@ -2122,6 +2394,25 @@ export default function App() {
         onChange={updateSetting}
         onReset={() => resetKeys(OPTION_KEYS)}
         onOpenSounds={() => setSoundsOpen(true)}
+      />
+
+      <TablesMenu
+        visible={tablesOpen}
+        onClose={() => setTablesOpen(false)}
+        list={tableList}
+        currentName={draftNameUi}
+        partCount={bumperCount}
+        onSave={saveCurrent}
+        onLoad={loadSaved}
+        onDelete={deleteSaved}
+        onNew={newDraft}
+      />
+
+      <GamePicker
+        visible={pickerOpen}
+        onClose={() => setPickerOpen(false)}
+        list={tableList}
+        onPick={startGame}
       />
 
       <DebugMenu
@@ -2565,6 +2856,38 @@ const styles = StyleSheet.create({
     justifyContent: 'flex-end',
     gap: 12,
     marginTop: 16,
+  },
+  saveRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginTop: 12,
+  },
+  nameInput: {
+    flex: 1,
+    color: 'white',
+    fontSize: 16,
+    borderWidth: 1,
+    borderColor: '#444',
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  tableRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingVertical: 8,
+  },
+  tableMeta: {
+    fontSize: 12,
+  },
+  pickRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: '#2c2c2c',
   },
   soundBlock: {
     paddingVertical: 8,

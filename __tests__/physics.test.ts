@@ -38,6 +38,14 @@ import {
   partShape,
   collideShape,
   PART_TYPES,
+  cleanTableName,
+  parseBackground,
+  saveTable,
+  deleteTable,
+  serializeTables,
+  parseTables,
+  tileHeight,
+  visibleTiles,
   type Part,
   type Bumper,
   type Lane,
@@ -1022,5 +1030,130 @@ describe('layout persistence of shaped parts', () => {
     const wall: Part = { id: 'w', type: 'wall', x: c.x, y: c.y, r: 0.0625, power: 1 };
     expect(canPlace(4, 10, [wall], 8, 4, 0.4, 0.0625)).toBe(true);
     expect(canPlace(3, 10, [wall], 8, 4, 0.4, 0.0625)).toBe(false);
+  });
+});
+
+describe('cleanTableName', () => {
+  it('trims and collapses whitespace', () => {
+    expect(cleanTableName('  My   table ')).toBe('My table');
+  });
+
+  it('refuses an empty name', () => {
+    expect(cleanTableName('   ')).toBeNull();
+    expect(cleanTableName('')).toBeNull();
+  });
+
+  it('caps the length', () => {
+    expect(cleanTableName('x'.repeat(60))).toHaveLength(24);
+  });
+});
+
+describe('parseBackground', () => {
+  it('keeps a file uri with a real size', () => {
+    expect(parseBackground({ uri: 'file:///bg.png', w: 400, h: 300 })).toEqual({
+      uri: 'file:///bg.png',
+      w: 400,
+      h: 300,
+    });
+  });
+
+  it('drops anything without a uri or a positive finite size', () => {
+    expect(parseBackground(null)).toBeNull();
+    expect(parseBackground({ uri: '', w: 1, h: 1 })).toBeNull();
+    expect(parseBackground({ uri: 'file:///a', w: 0, h: 1 })).toBeNull();
+    expect(parseBackground({ uri: 'file:///a', w: 1, h: NaN })).toBeNull();
+  });
+});
+
+describe('saved tables', () => {
+  const part: Part = { id: 'b1', type: 'bumper', x: 0.5, y: 1.2, r: 0.05, power: 1 };
+  let n = 0;
+  const makeId = () => `t${++n}`;
+  beforeEach(() => {
+    n = 0;
+  });
+
+  it('saves a new name as a new table', () => {
+    const r = saveTable([], { name: 'First', items: [part], background: null }, 100, makeId);
+    expect(r.replaced).toBe(false);
+    expect(r.tables).toEqual([
+      { id: 't1', name: 'First', savedAt: 100, items: [part], background: null },
+    ]);
+  });
+
+  it('overwrites a table of the same name, ignoring case, and keeps its id', () => {
+    const first = saveTable([], { name: 'First', items: [], background: null }, 100, makeId);
+    const again = saveTable(first.tables, { name: 'first', items: [part], background: null }, 200, makeId);
+    expect(again.replaced).toBe(true);
+    expect(again.tables).toHaveLength(1);
+    expect(again.table).toEqual({ id: 't1', name: 'first', savedAt: 200, items: [part], background: null });
+  });
+
+  it('lists the most recently saved first', () => {
+    let t = saveTable([], { name: 'A', items: [], background: null }, 100, makeId).tables;
+    t = saveTable(t, { name: 'B', items: [], background: null }, 200, makeId).tables;
+    expect(t.map((x) => x.name)).toEqual(['B', 'A']);
+  });
+
+  it('deletes by id', () => {
+    const t = saveTable([], { name: 'A', items: [], background: null }, 100, makeId).tables;
+    expect(deleteTable(t, 't1')).toEqual([]);
+  });
+
+  it('round-trips through storage JSON', () => {
+    const bg = { uri: 'file:///bg-t1.png', w: 300, h: 200 };
+    const t = saveTable([], { name: 'A', items: [part], background: bg }, 100, makeId).tables;
+    const json = JSON.stringify(serializeTables(t, 4, 8));
+    expect(parseTables(JSON.parse(json), 4)).toEqual(t);
+  });
+
+  it('reads garbage as no tables, and skips malformed entries', () => {
+    expect(parseTables(null, 4)).toEqual([]);
+    expect(parseTables({ v: 1, tables: 'x' }, 4)).toEqual([]);
+    const good = serializeTables(
+      saveTable([], { name: 'Good', items: [part], background: null }, 100, makeId).tables,
+      4,
+      8,
+    );
+    const raw = {
+      ...good,
+      tables: [
+        { id: 7, name: 'bad id' },
+        { id: 'no-name', name: '  ', savedAt: 1, layout: { v: 1, items: [] } },
+        { id: 'no-layout', name: 'X', savedAt: 1, layout: null },
+        ...good.tables,
+      ],
+    };
+    expect(parseTables(raw, 4).map((x) => x.name)).toEqual(['Good']);
+  });
+
+  it('keeps the first of two tables sharing an id', () => {
+    const good = serializeTables(
+      saveTable([], { name: 'Good', items: [], background: null }, 100, makeId).tables,
+      4,
+      8,
+    );
+    const raw = { ...good, tables: [...good.tables, { ...good.tables[0], name: 'Dupe' }] };
+    expect(parseTables(raw, 4).map((x) => x.name)).toEqual(['Good']);
+  });
+});
+
+describe('background tiles', () => {
+  // A 360-wide table; the image is fit to the width, so a 400×200 picture tiles every 180 px.
+  it('fits the image to the table width and keeps its aspect', () => {
+    expect(tileHeight(360, { uri: 'u', w: 400, h: 200 }, 24)).toBe(180);
+  });
+
+  it('never tiles thinner than the floor, so a panorama cannot spawn thousands of tiles', () => {
+    expect(tileHeight(360, { uri: 'u', w: 10000, h: 10 }, 24)).toBe(24);
+  });
+
+  it('lists only the tiles the view can see', () => {
+    // View from y = 500 to 1140 on a 1440-tall table, tiles 180 tall: 2 (360–540) … 6.
+    expect(visibleTiles(500, 640, 180, 1440)).toEqual([2, 3, 4, 5, 6]);
+  });
+
+  it('stops at the bottom of the table', () => {
+    expect(visibleTiles(1300, 640, 180, 1440)).toEqual([7]);
   });
 });

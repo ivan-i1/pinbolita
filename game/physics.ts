@@ -785,3 +785,124 @@ export function parseLayout(raw: unknown, aspect: number): { valid: boolean; ite
   }
   return { valid: true, items };
 }
+
+/** A picture under a table: a copied file and its pixel size, for the tile aspect. */
+export type Background = { uri: string; w: number; h: number };
+
+/** A table saved under a name in Creative, playable from Game. */
+export type SavedTable = {
+  id: string;
+  name: string;
+  savedAt: number;
+  items: Part[];
+  background: Background | null;
+};
+
+const TABLE_NAME_MAX = 24;
+
+/** A usable table name, or null: trimmed, inner whitespace collapsed, capped in length. */
+export function cleanTableName(raw: string): string | null {
+  const name = String(raw ?? '').replace(/\s+/g, ' ').trim().slice(0, TABLE_NAME_MAX).trim();
+  return name.length > 0 ? name : null;
+}
+
+/** A stored background, trusting nothing: a non-empty uri and a positive, finite size. */
+export function parseBackground(raw: unknown): Background | null {
+  if (raw === null || typeof raw !== 'object') return null;
+  const b = raw as Record<string, unknown>;
+  if (typeof b.uri !== 'string' || b.uri.length === 0) return null;
+  const ok = (n: unknown) => typeof n === 'number' && Number.isFinite(n) && n > 0;
+  if (!ok(b.w) || !ok(b.h)) return null;
+  return { uri: b.uri, w: b.w as number, h: b.h as number };
+}
+
+/**
+ * Save under a name. A table of the same name (ignoring case) is overwritten in place and
+ * keeps its id — and with it its background file; otherwise a new table is added. The
+ * list comes back most recently saved first.
+ */
+export function saveTable(
+  tables: SavedTable[],
+  entry: { name: string; items: Part[]; background: Background | null },
+  now: number,
+  makeId: () => string,
+): { tables: SavedTable[]; table: SavedTable; replaced: boolean } {
+  const key = entry.name.toLowerCase();
+  const existing = tables.find((t) => t.name.toLowerCase() === key);
+  const table: SavedTable = {
+    id: existing ? existing.id : makeId(),
+    name: entry.name,
+    savedAt: now,
+    items: entry.items,
+    background: entry.background,
+  };
+  const rest = tables.filter((t) => t !== existing);
+  return {
+    tables: [table, ...rest].sort((a, b) => b.savedAt - a.savedAt),
+    table,
+    replaced: Boolean(existing),
+  };
+}
+
+export function deleteTable(tables: SavedTable[], id: string): SavedTable[] {
+  return tables.filter((t) => t.id !== id);
+}
+
+/** The stored form: each table's parts in the same versioned envelope as the draft. */
+export function serializeTables(tables: SavedTable[], aspect: number, grid: number) {
+  return {
+    v: 1 as const,
+    tables: tables.map((t) => ({
+      id: t.id,
+      name: t.name,
+      savedAt: t.savedAt,
+      layout: serializeLayout(t.items, aspect, grid),
+      background: t.background,
+    })),
+  };
+}
+
+/**
+ * Read stored tables, trusting nothing. Anything that is not the envelope reads as no
+ * tables; an entry without an id, a usable name, a time or a valid layout is skipped, and
+ * of two entries sharing an id the first is kept.
+ */
+export function parseTables(raw: unknown, aspect: number): SavedTable[] {
+  if (raw === null || typeof raw !== 'object') return [];
+  const env = raw as Record<string, unknown>;
+  if (env.v !== 1 || !Array.isArray(env.tables)) return [];
+  const out: SavedTable[] = [];
+  const seen = new Set<string>();
+  for (const entry of env.tables) {
+    if (entry === null || typeof entry !== 'object') continue;
+    const e = entry as Record<string, unknown>;
+    if (typeof e.id !== 'string' || seen.has(e.id)) continue;
+    const name = typeof e.name === 'string' ? cleanTableName(e.name) : null;
+    if (!name) continue;
+    if (typeof e.savedAt !== 'number' || !Number.isFinite(e.savedAt)) continue;
+    const layout = parseLayout(e.layout, aspect);
+    if (!layout.valid) continue;
+    out.push({ id: e.id, name, savedAt: e.savedAt, items: layout.items, background: parseBackground(e.background) });
+    seen.add(e.id);
+  }
+  return out;
+}
+
+/**
+ * Height of one background tile: the picture fitted to the table's width, aspect kept.
+ * Floored, so a very wide picture cannot ask for thousands of tiles down the table.
+ */
+export function tileHeight(tableWidth: number, bg: Background, minHeight: number): number {
+  return Math.max(minHeight, (tableWidth * bg.h) / bg.w);
+}
+
+/** Indices of the background tiles that overlap the view, top to bottom. */
+export function visibleTiles(camY: number, viewHeight: number, tileH: number, worldHeight: number): number[] {
+  if (!(tileH > 0)) return [];
+  const last = Math.ceil(worldHeight / tileH) - 1;
+  const first = clamp(Math.floor(camY / tileH), 0, last);
+  const end = clamp(Math.ceil((camY + viewHeight) / tileH) - 1, 0, last);
+  const out: number[] = [];
+  for (let i = first; i <= end; i++) out.push(i);
+  return out;
+}
