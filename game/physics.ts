@@ -261,9 +261,23 @@ export function canSwipeCatch(lane: Lane, now: number, leniencyMs: number): bool
   return lane.phase === 'ready' || now >= lane.readyAt - leniencyMs;
 }
 
-/** Per-frame velocity retention inside a lane band: thickest when ready, thinner cooling. */
-export function laneRetention(lane: Lane, readyRetention: number, coolingRetention: number): number {
-  return lane.phase === 'ready' ? readyRetention : coolingRetention;
+/**
+ * The ball's per-frame velocity retention. Only a READY lane's band is viscous; a lane that
+ * is cooling down is open air, so a ball falls straight through it and drains — the lane is
+ * disabled, not just weaker.
+ */
+export function ballRetention(
+  inBand: boolean,
+  lane: Lane,
+  viscosity: number,
+  openAir: number,
+): number {
+  return inBand && lane.phase === 'ready' ? viscosity : openAir;
+}
+
+/** Whether entering the band caps the ball's speed: only a ready lane catches it. */
+export function slowsEntry(entering: boolean, lane: Lane): boolean {
+  return entering && lane.phase === 'ready';
 }
 
 export type LaneVisual = { kind: 'standby' | 'holding' | 'cooldown'; progress: number };
@@ -392,11 +406,13 @@ export function panProgress(elapsedMs: number, durationMs: number): number {
 }
 
 /**
- * Each lane's cooldown: the base split across the lanes. One lane covers the whole width
- * and waits longest; with more, each covers less and recovers sooner.
+ * Each lane's cooldown. More lanes cover more of the drain, so each waits longer: one lane
+ * recovers in 3 s, each of four in 7 s, and two and three sit on the straight line between.
+ * `scale` is the Debug multiplier on the whole line.
  */
-export function laneCooldownMs(baseSeconds: number, laneCount: number): number {
-  return (baseSeconds * 1000) / Math.max(1, Math.floor(laneCount) || 1);
+export function laneCooldownMs(laneCount: number, scale = 1): number {
+  const n = clamp(Math.floor(laneCount) || 1, 1, 4);
+  return (3000 + ((n - 1) * 4000) / 3) * scale;
 }
 
 /**

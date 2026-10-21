@@ -44,7 +44,8 @@ import {
   laneAfterLaunch,
   laneCooldownMs,
   laneOf,
-  laneRetention,
+  ballRetention,
+  slowsEntry,
   laneTick,
   laneVisual,
   launchArrow,
@@ -81,8 +82,8 @@ const DEFAULTS = {
   // gravity: the accelerometer is not used at all.
   pull: 0.2,
   laneCount: 1, // 1–4 equal lanes across the bottom
-  // Seconds of cooldown for a single lane; with more lanes each gets a share of it.
-  laneCooldown: 1.5,
+  // Multiplier on the lane cooldown line (one lane 3 s … each of four 7 s).
+  cooldownScale: 1,
   // Velocity kept per frame inside a ready lane: lower is thicker. 0.8 lets an ignored
   // ball sink through the lane band in roughly 2 s.
   viscosity: 0.8,
@@ -111,7 +112,7 @@ const STRESS_CHOICES = [0, 25, 50, 100];
 // above sit exactly on a stop.
 const SLIDERS = {
   pull: { min: 0.1, max: 0.5 },
-  laneCooldown: { min: 0.5, max: 2.5 },
+  cooldownScale: { min: 0.5, max: 1.5 },
   viscosity: { min: 0.7, max: 0.9 },
   bounciness: { min: 0.1, max: 1.3 }, // above 1 the ball gains energy on a bounce
   friction: { min: 0, max: 1 },
@@ -141,7 +142,7 @@ const OPTION_KEYS = [
 const DEBUG_KEYS = [
   'pull',
   'laneCount',
-  'laneCooldown',
+  'cooldownScale',
   'viscosity',
   'bounciness',
   'friction',
@@ -227,9 +228,6 @@ const RESPAWN_PAN_MS = 900;
 // viscosity needs ~v·r/(1−r) of travel to absorb it). 6 keeps an ignored ball in a ready
 // lane for roughly 3 s.
 const LANE_ENTRY_SPEED = 6 * SCALE;
-// A cooling lane is still thick, just less so, which is what makes the leniency usable:
-// at full speed a ball would cross the band in about a quarter of a second.
-const COOLING_RETENTION = 0.95;
 // A swipe may stop the ball this long before its lane's cooldown ends.
 const LENIENCY_MS = 500;
 // Launch-arrow length per unit of launch speed: the cap draws a 160 dp arrow at 360 dp.
@@ -449,7 +447,7 @@ const triggerBounceFeedback = (impactSpeed: number) => {
 // entity, so the camera offset is copied onto every world-space entity.
 const publish = (entities: any, now: number, here: { k: number; inBand: boolean }) => {
   const box = entities.box;
-  const cooldownMs = laneCooldownMs(settings.laneCooldown, lanes.length);
+  const cooldownMs = laneCooldownMs(lanes.length, settings.cooldownScale);
   entities.lanes.visuals = lanes.map((lane, i) =>
     laneVisual(lane, now, cooldownMs, !gameLost && here.inBand && i === here.k),
   );
@@ -525,11 +523,15 @@ const GameSystem = (entities: any, { time }: any) => {
   pendingImpulse.x = 0;
   pendingImpulse.y = 0;
 
-  // Inside a lane band the air turns to syrup: the pull keeps acting, so the ball sinks at
-  // a slow terminal speed instead of stopping — and drains if the player does nothing.
-  const retention = here.inBand
-    ? laneRetention(lanes[here.k], settings.viscosity, COOLING_RETENTION)
-    : frictionRetention(settings.friction, FRICTION_LOSS_AT_MAX);
+  // Inside a ready lane's band the air turns to syrup: the pull keeps acting, so the ball
+  // sinks at a slow terminal speed instead of stopping — and drains if the player does
+  // nothing. A cooling lane is disabled: open air, the ball falls straight through.
+  const retention = ballRetention(
+    here.inBand,
+    lanes[here.k],
+    settings.viscosity,
+    frictionRetention(settings.friction, FRICTION_LOSS_AT_MAX),
+  );
   // Integrate in pieces short enough that the ball cannot skip over a bumper, colliding
   // after each one. Splitting dtf is exact for the pull and the damping (r^(dtf/n))^n.
   let next = { x: box.position.x, y: box.position.y, vx: box.velocity.x, vy: box.velocity.y };
@@ -584,8 +586,14 @@ const GameSystem = (entities: any, { time }: any) => {
   const after = ballLane(box.position.x, box.position.y);
   const entering = after.inBand && !wasInBand;
   // A ball falling in from high up the table arrives near the speed cap, faster than the
-  // band can absorb; cap it on the way in so it sinks instead of punching through.
-  const entry = bandEntryVelocity(box.velocity.x, box.velocity.y, entering, LANE_ENTRY_SPEED);
+  // band can absorb; a ready lane caps it on the way in so it sinks instead of punching
+  // through. A cooling lane lets it fall.
+  const entry = bandEntryVelocity(
+    box.velocity.x,
+    box.velocity.y,
+    slowsEntry(entering, lanes[after.k]),
+    LANE_ENTRY_SPEED,
+  );
   box.velocity.x = entry.x;
   box.velocity.y = entry.y;
   if (entering && lanes[after.k].phase === 'ready' && settings.vibration) {
@@ -1123,12 +1131,12 @@ const DebugMenu = ({
             onPick={(v) => onChange('laneCount', v)}
           />
           <SliderRow
-            label="Lane cooldown (one lane)"
-            k="laneCooldown"
+            label="Lane cooldown"
+            k="cooldownScale"
             state={state}
             onChange={onChange}
             format={(v) =>
-              `${v.toFixed(1)} s → ${(laneCooldownMs(v, state.laneCount) / 1000).toFixed(2)} s each`
+              `×${v.toFixed(2)} → ${(laneCooldownMs(state.laneCount, v) / 1000).toFixed(1)} s each`
             }
           />
           <SliderRow
@@ -1492,7 +1500,7 @@ export default function App() {
           if (!launch) return;
           lanes = lanes.map((lane, i) =>
             i === k
-              ? laneAfterLaunch(lane, Date.now(), laneCooldownMs(settings.laneCooldown, lanes.length))
+              ? laneAfterLaunch(lane, Date.now(), laneCooldownMs(lanes.length, settings.cooldownScale))
               : lane,
           );
           box.velocity.x = launch.x;

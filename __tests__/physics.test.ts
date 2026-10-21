@@ -14,7 +14,8 @@ import {
   laneAfterLaunch,
   laneTick,
   canSwipeCatch,
-  laneRetention,
+  ballRetention,
+  slowsEntry,
   laneVisual,
   mixColor,
   launchArrow,
@@ -415,9 +416,22 @@ describe('lane state', () => {
     expect(canSwipeCatch(coolingUntil(2500), 2000, 500)).toBe(true);
   });
 
-  it('a ready lane is the most viscous, a cooling lane less so', () => {
-    expect(laneRetention(ready, 0.8, 0.95)).toBe(0.8);
-    expect(laneRetention(coolingUntil(9), 0.8, 0.95)).toBe(0.95);
+  it('a ready lane is viscous inside its band', () => {
+    expect(ballRetention(true, ready, 0.8, 0.99)).toBe(0.8);
+  });
+
+  it('a cooling lane is not viscous at all: the ball falls through it as in open air', () => {
+    expect(ballRetention(true, coolingUntil(9), 0.8, 0.99)).toBe(0.99);
+  });
+
+  it('outside the band the ball always flies in open air', () => {
+    expect(ballRetention(false, ready, 0.8, 0.99)).toBe(0.99);
+  });
+
+  it('only a ready lane slows a falling ball on entry', () => {
+    expect(slowsEntry(true, ready)).toBe(true);
+    expect(slowsEntry(true, coolingUntil(9))).toBe(false);
+    expect(slowsEntry(false, ready)).toBe(false);
   });
 });
 
@@ -594,17 +608,32 @@ describe('panProgress', () => {
 });
 
 describe('laneCooldownMs', () => {
-  it('gives one lane the full cooldown', () => {
-    expect(laneCooldownMs(1.5, 1)).toBe(1500);
+  it('gives a single lane the shortest cooldown, 3 s', () => {
+    expect(laneCooldownMs(1)).toBe(3000);
   });
 
-  it('shortens each lane cooldown as the lanes multiply', () => {
-    expect(laneCooldownMs(1.5, 2)).toBe(750);
-    expect(laneCooldownMs(1.5, 4)).toBe(375);
+  it('gives each of four lanes 7 s', () => {
+    expect(laneCooldownMs(4)).toBe(7000);
   });
 
-  it('treats a nonsense lane count as one lane', () => {
-    expect(laneCooldownMs(1.5, 0)).toBe(1500);
+  it('fills in two and three lanes on the straight line between', () => {
+    expect(laneCooldownMs(2)).toBeCloseTo(3000 + 4000 / 3, 6);
+    expect(laneCooldownMs(3)).toBeCloseTo(3000 + 8000 / 3, 6);
+  });
+
+  it('gets slower with every lane added', () => {
+    for (let n = 1; n < 4; n++) expect(laneCooldownMs(n + 1)).toBeGreaterThan(laneCooldownMs(n));
+  });
+
+  it('treats a nonsense lane count as one lane, and clamps past four', () => {
+    expect(laneCooldownMs(0)).toBe(3000);
+    expect(laneCooldownMs(NaN)).toBe(3000);
+    expect(laneCooldownMs(9)).toBe(7000);
+  });
+
+  it('scales the whole line by the Debug multiplier', () => {
+    expect(laneCooldownMs(1, 0.5)).toBe(1500);
+    expect(laneCooldownMs(4, 1.5)).toBe(10500);
   });
 });
 
