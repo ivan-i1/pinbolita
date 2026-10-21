@@ -30,11 +30,15 @@ import {
   capSpeed,
   cellCenter,
   cellOf,
-  collideCircle,
+  collideShape,
+  partShape,
+  PART_TYPES,
   parseLayout,
   serializeLayout,
   substepCount,
-  type Bumper,
+  type Part,
+  type PartType,
+  type Shape,
   catchFraction,
   frameScale,
   frictionRetention,
@@ -200,6 +204,10 @@ if (__DEV__ && LANE_DEPTH <= MAX_SPEED * 2 + BALL_SIZE) {
 // the bumper's power.
 const GRID_CELLS = 8;
 const BUMPER_RADIUS_TW = 0.05;
+// A wall fills its whole cell, so walls in neighbouring cells join into one longer wall.
+const WALL_HALF_TW = 0.5 / 8;
+// Half-thickness of the /, \, X and + bars.
+const BAR_HALF_TW = 0.014;
 const BUMPER_KICK = 8 * SCALE;
 const POWER_CHOICES = [0.5, 1, 1.5, 2];
 const LAYOUT_STORAGE_KEY = '@pinbolita:layout';
@@ -298,8 +306,16 @@ type Mode = 'menu' | 'game' | 'creative' | 'test';
 let mode: Mode = 'menu';
 // The Creative layout, in table-width units, and the bumpers the ball actually hits:
 // the layout during Test, nothing in Game (ADV-REV Q32, default: an empty table).
-let layout: Bumper[] = [];
-let activeBumpers: Bumper[] = [];
+let layout: Part[] = [];
+let activeBumpers: Part[] = [];
+// Collision outlines of activeBumpers in px, rebuilt whenever the active table changes.
+let activeShapes: Shape[] = [];
+const shapeOf = (p: Part) =>
+  partShape(p.type, p.x * SCREEN_WIDTH, p.y * SCREEN_WIDTH, p.r * SCREEN_WIDTH, BAR_HALF_TW * SCREEN_WIDTH);
+const setActiveParts = (parts: Part[]) => {
+  activeBumpers = parts;
+  activeShapes = parts.map(shapeOf);
+};
 // When each bumper was last hit, for a brief flash.
 const bumperHits: Record<string, number> = {};
 // The cell a Creative touch would act on, shown while the finger is down.
@@ -533,13 +549,16 @@ const GameSystem = (entities: any, { time }: any) => {
   const pieces = substepCount(Math.hypot(next.vx, next.vy) * dtf, MAX_SUBSTEP, MAX_SUBSTEPS);
   for (let s = 0; s < pieces; s++) {
     next = stepBall(next, settings.pull * SCALE, dtf / pieces, retention, MAX_SPEED);
-    for (const bumper of activeBumpers) {
-      const contact = collideCircle(
+    for (let i = 0; i < activeBumpers.length; i++) {
+      const bumper = activeBumpers[i];
+      // Bumpers of every shape kick; a wall only bounces, like the table's own walls.
+      const wall = bumper.type === 'wall';
+      const contact = collideShape(
         next,
-        bumper.x * SCREEN_WIDTH,
-        bumper.y * SCREEN_WIDTH,
-        RADIUS + bumper.r * SCREEN_WIDTH,
-        BUMPER_KICK * bumper.power,
+        activeShapes[i],
+        RADIUS,
+        wall ? 0 : BUMPER_KICK * bumper.power,
+        wall ? settings.bounciness : 1,
       );
       if (!contact.hit) continue;
       next = contact.ball;
@@ -691,40 +710,107 @@ const LaunchArrow = ({ visible, x, y: worldY, length, angle, camY }: any) => {
   );
 };
 
-// Bumpers, in table-width units, drawn at their place on the table. Stronger bumpers are
-// brighter and carry their power as a label; a hit flashes the rim for a moment.
+// One part, drawn in a 2h × 2h box. The bars of /, \, X and + stop inside the round
+// bumper's circle, like their collision outlines (partShape). Bumpers are purple, brighter
+// with power; walls are stone grey.
+const bumperColor = (power: number) => mixColor('#5b2a86', '#c77dff', (power - 0.5) / 1.5);
+const WALL_COLOR = '#6b7280';
+const PartGlyph = ({
+  type,
+  h,
+  power,
+  flashing = false,
+  label = false,
+}: {
+  type: PartType;
+  h: number;
+  power: number;
+  flashing?: boolean;
+  label?: boolean;
+}) => {
+  const color = type === 'wall' ? WALL_COLOR : bumperColor(power);
+  const rim = flashing ? styles.partFlash : null;
+  const bar = Math.max(3, (BAR_HALF_TW / BUMPER_RADIUS_TW) * h * 2);
+  const bars: number[] =
+    type === 'slash' ? [-45] : type === 'backslash' ? [45] : type === 'x' ? [45, -45] : type === 'plus' ? [0, 90] : [];
+  return (
+    <View style={{ width: 2 * h, height: 2 * h, alignItems: 'center', justifyContent: 'center' }}>
+      {type === 'bumper' && (
+        <View
+          style={[styles.partBody, { width: 2 * h, height: 2 * h, borderRadius: h, backgroundColor: color }, rim]}
+        >
+          {label && <Text style={styles.bumperLabel}>×{power}</Text>}
+        </View>
+      )}
+      {bars.map((deg) => (
+        <View
+          key={deg}
+          style={[
+            styles.partBody,
+            {
+              position: 'absolute',
+              width: 2 * h,
+              height: bar,
+              borderRadius: bar / 2,
+              backgroundColor: color,
+              transform: [{ rotate: `${deg}deg` }],
+            },
+            rim,
+          ]}
+        />
+      ))}
+      {type === 'diamond' && (
+        <View
+          style={[
+            styles.partBody,
+            {
+              width: h * Math.SQRT2,
+              height: h * Math.SQRT2,
+              backgroundColor: color,
+              transform: [{ rotate: '45deg' }],
+            },
+            rim,
+          ]}
+        />
+      )}
+      {type === 'wall' && (
+        <View style={[styles.partBody, styles.wall, { width: 2 * h, height: 2 * h }, rim]} />
+      )}
+    </View>
+  );
+};
+
+// Parts, in table-width units, drawn at their place on the table. A hit flashes the rim.
 const BumperField = ({
   items,
   hits,
   now,
   camY,
 }: {
-  items: Bumper[];
+  items: Part[];
   hits: Record<string, number>;
   now: number;
   camY: number;
 }) => (
   <View style={StyleSheet.absoluteFill} pointerEvents="none">
     {(items ?? []).map((b) => {
-      const r = b.r * SCREEN_WIDTH;
-      const flashing = now - (hits?.[b.id] ?? -Infinity) < BUMPER_FLASH_MS;
+      const h = b.r * SCREEN_WIDTH;
       return (
         <View
           key={b.id}
-          style={[
-            styles.bumper,
-            {
-              left: b.x * SCREEN_WIDTH - r,
-              top: toScreenY(b.y * SCREEN_WIDTH, camY ?? 0) - r,
-              width: 2 * r,
-              height: 2 * r,
-              borderRadius: r,
-              backgroundColor: mixColor('#5b2a86', '#c77dff', (b.power - 0.5) / 1.5),
-            },
-            flashing && styles.bumperFlash,
-          ]}
+          style={{
+            position: 'absolute',
+            left: b.x * SCREEN_WIDTH - h,
+            top: toScreenY(b.y * SCREEN_WIDTH, camY ?? 0) - h,
+          }}
         >
-          <Text style={styles.bumperLabel}>×{b.power}</Text>
+          <PartGlyph
+            type={b.type}
+            h={h}
+            power={b.power}
+            flashing={now - (hits?.[b.id] ?? -Infinity) < BUMPER_FLASH_MS}
+            label
+          />
         </View>
       );
     })}
@@ -819,7 +905,7 @@ const gameEntities = {
     renderer: <LaneStrip visuals={[]} camY={0} />,
   },
   bumpers: {
-    items: [] as Bumper[],
+    items: [] as Part[],
     hits: bumperHits,
     now: 0,
     camY: 0,
@@ -859,6 +945,8 @@ const gameEntities = {
 // is down. Saved shortly after each change.
 
 let partPower = 1;
+let partType: PartType = 'bumper';
+const halfSizeOf = (type: PartType) => (type === 'wall' ? WALL_HALF_TW : BUMPER_RADIUS_TW);
 const edit = { startCamera: 0, scrolling: false };
 let layoutSaveTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -883,7 +971,7 @@ const aimGhost = (pageX: number, pageY: number) => {
   ghost.row = row;
   ghost.kind = bumperAt(col, row)
     ? 'remove'
-    : canPlace(col, row, layout, GRID_CELLS, TABLE_ASPECT, LANE_DEPTH / SCREEN_WIDTH, BUMPER_RADIUS_TW)
+    : canPlace(col, row, layout, GRID_CELLS, TABLE_ASPECT, LANE_DEPTH / SCREEN_WIDTH, halfSizeOf(partType))
       ? 'place'
       : 'blocked';
   ghost.visible = true;
@@ -915,11 +1003,11 @@ const endEdit = () => {
       ...layout,
       {
         id: `b${Date.now().toString(36)}${nextBumperId++}`,
-        type: 'bumper',
+        type: partType,
         x: c.x,
         y: c.y,
-        r: BUMPER_RADIUS_TW,
-        power: partPower,
+        r: halfSizeOf(partType),
+        power: partType === 'wall' ? 1 : partPower,
       },
     ];
   } else {
@@ -1137,11 +1225,22 @@ const DebugMenu = ({
 
 // Each sound gets its own file picker and its own volume, so a loud custom bounce can be
 // tamed without turning the hit sound down with it.
-// Creative's part picker. Bumpers are the only part for now (ADV-REV Q3); later
-// deliverables add pads and destructible pieces here.
+// Creative's part picker: a shape, and for bumpers the power of new ones. Walls have no
+// power — they bounce with the table's own bounciness.
+const PART_LABELS: Record<PartType, string> = {
+  bumper: 'Round',
+  slash: '/',
+  backslash: '\\',
+  x: 'X',
+  plus: '+',
+  diamond: 'Rhombus',
+  wall: 'Wall',
+};
 const PartsMenu = ({
   visible,
   onClose,
+  type,
+  onType,
   power,
   onPower,
   count,
@@ -1149,6 +1248,8 @@ const PartsMenu = ({
 }: {
   visible: boolean;
   onClose: () => void;
+  type: PartType;
+  onType: (t: PartType) => void;
   power: number;
   onPower: (p: number) => void;
   count: number;
@@ -1158,20 +1259,35 @@ const PartsMenu = ({
     <View style={styles.modalBackdrop}>
       <View style={styles.modalCard}>
         <Text style={styles.modalTitle}>Parts</Text>
-        <View style={[styles.choiceRow, { marginBottom: 8 }]}>
-          <View style={[styles.choice, styles.choiceOn, { paddingHorizontal: 16 }]}>
-            <Text style={[styles.choiceText, styles.choiceTextOn]}>Bumper</Text>
-          </View>
+        <View style={styles.partGrid}>
+          {PART_TYPES.map((t) => (
+            <TouchableOpacity
+              key={t}
+              style={[styles.partTile, t === type && styles.partTileOn]}
+              onPress={() => onType(t)}
+              accessibilityLabel={PART_LABELS[t]}
+              accessibilityState={{ selected: t === type }}
+            >
+              <PartGlyph type={t} h={14} power={t === 'wall' ? 1 : power} />
+              <Text style={styles.partTileText}>{PART_LABELS[t]}</Text>
+            </TouchableOpacity>
+          ))}
         </View>
-        <ChoiceRow
-          label="Power of new bumpers (×)"
-          choices={POWER_CHOICES}
-          value={power}
-          onPick={onPower}
-        />
+        {type === 'wall' ? (
+          <Text style={[styles.rowLabel, styles.muted, { marginTop: 12 }]}>
+            Walls fill their cell and join their neighbours. They do not kick: the ball bounces
+            off them like off the table's sides.
+          </Text>
+        ) : (
+          <ChoiceRow
+            label="Power of new bumpers (×)"
+            choices={POWER_CHOICES}
+            value={power}
+            onPick={onPower}
+          />
+        )}
         <Text style={[styles.rowLabel, styles.muted, { marginTop: 12 }]}>
-          {count} bumper{count === 1 ? '' : 's'} on the table. Tap an empty cell to place one, tap
-          a bumper to remove it, drag to scroll.
+          {count} part{count === 1 ? '' : 's'} on the table.
         </Text>
         <View style={styles.modalActions}>
           <TouchableOpacity
@@ -1313,6 +1429,7 @@ export default function App() {
   const [screen, setScreen] = useState<Mode>('menu');
   const [partsOpen, setPartsOpen] = useState(false);
   const [power, setPower] = useState(partPower);
+  const [kind, setKind] = useState<PartType>(partType);
   const [bumperCount, setBumperCount] = useState(0);
   const go = (next: Mode) => {
     mode = next;
@@ -1530,7 +1647,7 @@ export default function App() {
   // From the start menu: a fresh, empty table viewed from the top (ADV-REV Q32 default).
   const startGame = () => {
     resetTable();
-    activeBumpers = [];
+    setActiveParts([]);
     respawnPan = null;
     camera.y = 0;
     hideBar();
@@ -1541,7 +1658,7 @@ export default function App() {
   // Creative: no ball; the layout under a build grid, scrolled by hand from the top.
   const enterCreative = () => {
     resetTable();
-    activeBumpers = [];
+    setActiveParts([]);
     respawnPan = null;
     camera.y = 0;
     ghost.visible = false;
@@ -1554,7 +1671,7 @@ export default function App() {
   // Test plays the layout, then hands back to Creative on pause or loss (ADV-REV Q16).
   const startTest = () => {
     resetTable();
-    activeBumpers = [...layout];
+    setActiveParts([...layout]);
     respawnPan = null;
     camera.y = 0;
     hideBar();
@@ -1564,7 +1681,7 @@ export default function App() {
 
   const exitTest = () => {
     resetTable();
-    activeBumpers = [];
+    setActiveParts([]);
     hideBar();
     go('creative');
     setRunning(true);
@@ -1572,7 +1689,7 @@ export default function App() {
 
   const backToMenu = () => {
     resetTable();
-    activeBumpers = [];
+    setActiveParts([]);
     ghost.visible = false;
     hideBar();
     go('menu');
@@ -1582,6 +1699,11 @@ export default function App() {
   const choosePower = (p: number) => {
     partPower = p;
     setPower(p);
+  };
+
+  const chooseType = (t: PartType) => {
+    partType = t;
+    setKind(t);
   };
 
   const clearTable = () =>
@@ -1925,13 +2047,10 @@ export default function App() {
             {/* The right-side tool strip (ADV-REV Q3, Q23): Parts, Debug, Test, plus Menu. */}
             <View style={styles.strip}>
               <TouchableOpacity style={styles.stripPart} onPress={() => setPartsOpen(true)}>
-                <View
-                  style={[
-                    styles.stripPartDot,
-                    { backgroundColor: mixColor('#5b2a86', '#c77dff', (power - 0.5) / 1.5) },
-                  ]}
-                />
-                <Text style={styles.stripPartText}>×{power}</Text>
+                <PartGlyph type={kind} h={14} power={kind === 'wall' ? 1 : power} />
+                <Text style={styles.stripPartText}>
+                  {kind === 'wall' ? 'Wall' : `×${power}`}
+                </Text>
               </TouchableOpacity>
               <TouchableOpacity style={styles.stripButton} onPress={() => setPartsOpen(true)}>
                 <Text style={styles.stripButtonText}>Parts</Text>
@@ -1953,6 +2072,8 @@ export default function App() {
       <PartsMenu
         visible={partsOpen}
         onClose={() => setPartsOpen(false)}
+        type={kind}
+        onType={chooseType}
         power={power}
         onPower={choosePower}
         count={bumperCount}
@@ -2042,16 +2163,20 @@ const styles = StyleSheet.create({
     borderTopWidth: 2,
     borderTopColor: 'rgba(3,218,198,0.6)',
   },
-  bumper: {
-    position: 'absolute',
+  partBody: {
     borderWidth: 2,
     borderColor: 'rgba(255,255,255,0.35)',
     alignItems: 'center',
     justifyContent: 'center',
   },
-  bumperFlash: {
+  partFlash: {
     borderColor: 'white',
-    borderWidth: 4,
+    borderWidth: 3,
+  },
+  wall: {
+    backgroundColor: WALL_COLOR,
+    borderColor: 'rgba(0,0,0,0.45)',
+    borderRadius: 2,
   },
   bumperLabel: {
     color: 'white',
@@ -2109,17 +2234,32 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     backgroundColor: 'rgba(30,30,30,0.92)',
   },
-  stripPartDot: {
-    width: 28,
-    height: 28,
-    borderRadius: 14,
-    borderWidth: 2,
-    borderColor: 'rgba(255,255,255,0.35)',
-  },
   stripPartText: {
     color: 'white',
     fontSize: 11,
     marginTop: 4,
+  },
+  partGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  partTile: {
+    width: 64,
+    paddingVertical: 8,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#444',
+    alignItems: 'center',
+    gap: 6,
+  },
+  partTileOn: {
+    borderColor: '#03dac6',
+    backgroundColor: 'rgba(3,218,198,0.15)',
+  },
+  partTileText: {
+    color: 'white',
+    fontSize: 12,
   },
   creativeBadge: {
     position: 'absolute',

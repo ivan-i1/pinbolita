@@ -511,7 +511,210 @@ export function cellCenter(col: number, row: number, cells: number): Vec {
   return { x: (col + 0.5) / cells, y: (row + 0.5) / cells };
 }
 
-export type Bumper = { id: string; type: 'bumper'; x: number; y: number; r: number; power: number };
+/**
+ * Everything Creative can place. All bumper shapes fit the round bumper's circle; a wall
+ * fills its whole grid cell, so walls in neighbouring cells join into longer walls.
+ */
+export const PART_TYPES = ['bumper', 'slash', 'backslash', 'x', 'plus', 'diamond', 'wall'] as const;
+export type PartType = (typeof PART_TYPES)[number];
+
+/** A placed part, in table-width units. `r` is its half-size; walls ignore `power`. */
+export type Part = { id: string; type: PartType; x: number; y: number; r: number; power: number };
+/** The name 1c used, before parts had shapes. */
+export type Bumper = Part;
+
+/**
+ * A part's collision outline, in px.
+ *   circle   — the round bumper
+ *   segments — straight bars of half-thickness `half` (/, \, X, +)
+ *   polygon  — a convex outline, corners in order (rhombus, wall)
+ */
+export type Shape =
+  | { kind: 'circle'; cx: number; cy: number; r: number }
+  | { kind: 'segments'; segs: [number, number, number, number][]; half: number }
+  | { kind: 'polygon'; verts: Vec[] };
+
+/**
+ * The outline of a part centred on (cx, cy) with half-size `h`. Bars stop short of the
+ * half-size by their own half-thickness, so their rounded ends stay inside the round
+ * bumper's circle: every bumper shape is the same size.
+ */
+export function partShape(type: PartType, cx: number, cy: number, h: number, barHalf: number): Shape {
+  const d = Math.max(0, h - barHalf);
+  const diag = d / Math.SQRT2;
+  const slash: [number, number, number, number] = [cx - diag, cy + diag, cx + diag, cy - diag];
+  const backslash: [number, number, number, number] = [cx - diag, cy - diag, cx + diag, cy + diag];
+  switch (type) {
+    case 'bumper':
+      return { kind: 'circle', cx, cy, r: h };
+    case 'slash':
+      return { kind: 'segments', segs: [slash], half: barHalf };
+    case 'backslash':
+      return { kind: 'segments', segs: [backslash], half: barHalf };
+    case 'x':
+      return { kind: 'segments', segs: [slash, backslash], half: barHalf };
+    case 'plus':
+      return {
+        kind: 'segments',
+        segs: [
+          [cx - d, cy, cx + d, cy],
+          [cx, cy - d, cx, cy + d],
+        ],
+        half: barHalf,
+      };
+    case 'diamond':
+      return {
+        kind: 'polygon',
+        verts: [
+          { x: cx, y: cy - h },
+          { x: cx + h, y: cy },
+          { x: cx, y: cy + h },
+          { x: cx - h, y: cy },
+        ],
+      };
+    case 'wall':
+      return {
+        kind: 'polygon',
+        verts: [
+          { x: cx - h, y: cy - h },
+          { x: cx + h, y: cy - h },
+          { x: cx + h, y: cy + h },
+          { x: cx - h, y: cy + h },
+        ],
+      };
+  }
+}
+
+/** Closest point to (px, py) on the segment a→b. */
+function closestOnSegment(px: number, py: number, ax: number, ay: number, bx: number, by: number): Vec {
+  const ex = bx - ax;
+  const ey = by - ay;
+  const len2 = ex * ex + ey * ey;
+  const t = len2 > 0 ? clamp(((px - ax) * ex + (py - ay) * ey) / len2, 0, 1) : 0;
+  return { x: ax + ex * t, y: ay + ey * t };
+}
+
+/**
+ * Settle a contact: the ball goes to `to`, and if it was moving into the surface (against
+ * the outward normal n), its normal velocity is reflected with `restitution` and `kick` is
+ * added outward. A bumper reflects fully and kicks; a wall only bounces.
+ */
+function resolveContact(
+  ball: Ball,
+  to: Vec,
+  nx: number,
+  ny: number,
+  kick: number,
+  restitution: number,
+): { ball: Ball; hit: boolean; impact: number } {
+  const vn = ball.vx * nx + ball.vy * ny;
+  if (vn >= 0) return { ball: { x: to.x, y: to.y, vx: ball.vx, vy: ball.vy }, hit: true, impact: 0 };
+  const k = (1 + restitution) * vn;
+  return {
+    ball: { x: to.x, y: to.y, vx: ball.vx - k * nx + kick * nx, vy: ball.vy - k * ny + kick * ny },
+    hit: true,
+    impact: -vn,
+  };
+}
+
+/**
+ * Ball (radius `ballR`) against any part outline. Same contract as collideCircle: push out
+ * to touching distance, reflect an inward hit, add `kick` outward; `impact` is the inward
+ * normal speed. A ball found inside a polygon (one stalled frame too far) leaves through
+ * the nearest face.
+ */
+export function collideShape(
+  ball: Ball,
+  shape: Shape,
+  ballR: number,
+  kick: number,
+  restitution: number,
+): { ball: Ball; hit: boolean; impact: number } {
+  const miss = { ball, hit: false, impact: 0 };
+
+  if (shape.kind === 'circle') {
+    const dx = ball.x - shape.cx;
+    const dy = ball.y - shape.cy;
+    const dist = Math.hypot(dx, dy);
+    const reach = shape.r + ballR;
+    if (dist >= reach) return miss;
+    const nx = dist > 1e-9 ? dx / dist : 0;
+    const ny = dist > 1e-9 ? dy / dist : -1;
+    return resolveContact(ball, { x: shape.cx + nx * reach, y: shape.cy + ny * reach }, nx, ny, kick, restitution);
+  }
+
+  if (shape.kind === 'segments') {
+    // The bar the ball is deepest into decides; for an X or + that is the arm it touches.
+    let best: { q: Vec; dist: number; seg: [number, number, number, number] } | null = null;
+    for (const seg of shape.segs) {
+      const q = closestOnSegment(ball.x, ball.y, ...seg);
+      const dist = Math.hypot(ball.x - q.x, ball.y - q.y);
+      if (!best || dist < best.dist) best = { q, dist, seg };
+    }
+    const reach = shape.half + ballR;
+    if (!best || best.dist >= reach) return miss;
+    let nx: number;
+    let ny: number;
+    if (best.dist > 1e-9) {
+      nx = (ball.x - best.q.x) / best.dist;
+      ny = (ball.y - best.q.y) / best.dist;
+    } else {
+      // Dead on the bar: leave through its upper side, out of the way of the pull.
+      const [ax, ay, bx, by] = best.seg;
+      const len = Math.hypot(bx - ax, by - ay) || 1;
+      nx = -(by - ay) / len;
+      ny = (bx - ax) / len;
+      if (ny > 0 || (ny === 0 && nx > 0)) {
+        nx = -nx;
+        ny = -ny;
+      }
+    }
+    return resolveContact(ball, { x: best.q.x + nx * reach, y: best.q.y + ny * reach }, nx, ny, kick, restitution);
+  }
+
+  // Convex polygon. Inside means on the inner side of every edge.
+  const v = shape.verts;
+  const n = v.length;
+  const cx = v.reduce((a, p) => a + p.x, 0) / n;
+  const cy = v.reduce((a, p) => a + p.y, 0) / n;
+  let inside = true;
+  let nearest: { q: Vec; dist: number; nx: number; ny: number } | null = null;
+  for (let i = 0; i < n; i++) {
+    const a = v[i];
+    const b = v[(i + 1) % n];
+    const ex = b.x - a.x;
+    const ey = b.y - a.y;
+    const len = Math.hypot(ex, ey) || 1;
+    // Outward normal: the edge's perpendicular that points away from the centre.
+    let nx = ey / len;
+    let ny = -ex / len;
+    if ((a.x - cx) * nx + (a.y - cy) * ny < 0) {
+      nx = -nx;
+      ny = -ny;
+    }
+    if ((ball.x - a.x) * nx + (ball.y - a.y) * ny > 0) inside = false;
+    const q = closestOnSegment(ball.x, ball.y, a.x, a.y, b.x, b.y);
+    const dist = Math.hypot(ball.x - q.x, ball.y - q.y);
+    if (!nearest || dist < nearest.dist) nearest = { q, dist, nx, ny };
+  }
+  if (!nearest) return miss;
+
+  if (inside) {
+    const { q, nx, ny } = nearest;
+    return resolveContact(ball, { x: q.x + nx * ballR, y: q.y + ny * ballR }, nx, ny, kick, restitution);
+  }
+  if (nearest.dist >= ballR) return miss;
+  const nx = (ball.x - nearest.q.x) / nearest.dist;
+  const ny = (ball.y - nearest.q.y) / nearest.dist;
+  return resolveContact(
+    ball,
+    { x: nearest.q.x + nx * ballR, y: nearest.q.y + ny * ballR },
+    nx,
+    ny,
+    kick,
+    restitution,
+  );
+}
 
 /**
  * Whether a bumper of radius `r` may go in this cell: on the grid, off the spawn row, clear
@@ -520,7 +723,7 @@ export type Bumper = { id: string; type: 'bumper'; x: number; y: number; r: numb
 export function canPlace(
   col: number,
   row: number,
-  items: Bumper[],
+  items: Part[],
   cells: number,
   aspect: number,
   laneDepth: number,
@@ -537,11 +740,11 @@ export type Layout = {
   units: 'tw';
   aspect: number;
   grid: number;
-  items: Bumper[];
+  items: Part[];
 };
 
 /** The persisted form of a table. Positions are table-width units, so it fits any phone. */
-export function serializeLayout(items: Bumper[], aspect: number, grid: number): Layout {
+export function serializeLayout(items: Part[], aspect: number, grid: number): Layout {
   return { v: 1, units: 'tw', aspect, grid, items };
 }
 
@@ -554,23 +757,25 @@ export function serializeLayout(items: Bumper[], aspect: number, grid: number): 
  * malformed bumpers are dropped, the rest are clamped onto the table, and duplicate ids
  * keep the first.
  */
-export function parseLayout(raw: unknown, aspect: number): { valid: boolean; items: Bumper[] } {
+export function parseLayout(raw: unknown, aspect: number): { valid: boolean; items: Part[] } {
   if (raw === null || typeof raw !== 'object') return { valid: false, items: [] };
   const layout = raw as Record<string, unknown>;
   if (layout.v !== 1 || !Array.isArray(layout.items)) return { valid: false, items: [] };
 
-  const items: Bumper[] = [];
+  const items: Part[] = [];
   const seen = new Set<string>();
+  const known = new Set<string>(PART_TYPES);
   for (const entry of layout.items) {
     if (entry === null || typeof entry !== 'object') continue;
     const e = entry as Record<string, unknown>;
-    if (e.type !== 'bumper' || typeof e.id !== 'string' || seen.has(e.id)) continue;
+    if (typeof e.type !== 'string' || !known.has(e.type)) continue;
+    if (typeof e.id !== 'string' || seen.has(e.id)) continue;
     const nums = [e.x, e.y, e.r, e.power];
     if (!nums.every((n) => typeof n === 'number' && Number.isFinite(n))) continue;
     const r = clamp(e.r as number, 0.02, 0.2);
     items.push({
       id: e.id,
-      type: 'bumper',
+      type: e.type as PartType,
       x: clamp(e.x as number, r, 1 - r),
       y: clamp(e.y as number, r, aspect - r),
       r,

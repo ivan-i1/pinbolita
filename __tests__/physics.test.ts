@@ -35,6 +35,10 @@ import {
   canPlace,
   parseLayout,
   serializeLayout,
+  partShape,
+  collideShape,
+  PART_TYPES,
+  type Part,
   type Bumper,
   type Lane,
   type Rng,
@@ -862,5 +866,161 @@ describe('layout persistence', () => {
   it('keeps only the first of two bumpers sharing an id', () => {
     const r = parseLayout({ v: 1, items: [b1, { ...b1, x: 0.2 }] }, 4);
     expect(r.items).toEqual([b1]);
+  });
+});
+
+describe('partShape', () => {
+  // Centre (100, 100), half-size 20, bar half-thickness 4.
+  it('a round bumper is a circle of the half-size', () => {
+    expect(partShape('bumper', 100, 100, 20, 4)).toEqual({ kind: 'circle', cx: 100, cy: 100, r: 20 });
+  });
+
+  it('a / runs bottom-left to top-right and fits inside the round bumper', () => {
+    const s = partShape('slash', 100, 100, 20, 4);
+    if (s.kind !== 'segments') throw new Error('expected segments');
+    const [[ax, ay, bx, by]] = s.segs;
+    expect(ax).toBeLessThan(bx); // left end …
+    expect(ay).toBeGreaterThan(by); // … is the lower one (screen y grows down)
+    expect(Math.hypot(ax - 100, ay - 100) + s.half).toBeCloseTo(20, 10);
+  });
+
+  it('a \\ runs top-left to bottom-right', () => {
+    const s = partShape('backslash', 100, 100, 20, 4);
+    if (s.kind !== 'segments') throw new Error('expected segments');
+    const [[ax, ay, bx, by]] = s.segs;
+    expect(ax).toBeLessThan(bx);
+    expect(ay).toBeLessThan(by);
+  });
+
+  it('an X and a + are two crossing bars', () => {
+    const x = partShape('x', 100, 100, 20, 4);
+    const plus = partShape('plus', 100, 100, 20, 4);
+    expect(x.kind === 'segments' && x.segs.length).toBe(2);
+    expect(plus.kind === 'segments' && plus.segs.length).toBe(2);
+  });
+
+  it('a rhombus has its corners on the axes at the half-size', () => {
+    expect(partShape('diamond', 100, 100, 20, 4)).toEqual({
+      kind: 'polygon',
+      verts: [
+        { x: 100, y: 80 },
+        { x: 120, y: 100 },
+        { x: 100, y: 120 },
+        { x: 80, y: 100 },
+      ],
+    });
+  });
+
+  it('a wall is a square of the half-size', () => {
+    const s = partShape('wall', 100, 100, 20, 4);
+    if (s.kind !== 'polygon') throw new Error('expected polygon');
+    expect(s.verts.map((v) => [v.x, v.y])).toEqual([
+      [80, 80],
+      [120, 80],
+      [120, 120],
+      [80, 120],
+    ]);
+  });
+
+  it('knows every part type', () => {
+    for (const t of PART_TYPES) expect(() => partShape(t, 0, 0, 10, 2)).not.toThrow();
+  });
+});
+
+describe('collideShape', () => {
+  const ball = (x: number, y: number, vx: number, vy: number) => ({ x, y, vx, vy });
+  // Ball radius 10; parts centred on (100, 100), half-size 20, bars 4 thick each side.
+  const shape = (t: Part['type']) => partShape(t, 100, 100, 20, 4);
+
+  it('ignores a ball nowhere near', () => {
+    expect(collideShape(ball(100, 10, 0, 5), shape('wall'), 10, 0, 1).hit).toBe(false);
+    expect(collideShape(ball(100, 10, 0, 5), shape('plus'), 10, 0, 1).hit).toBe(false);
+  });
+
+  it('a / turns a ball falling straight down to the left', () => {
+    // Touching the bar from above, at its centre.
+    const r = collideShape(ball(100 - 9, 100 - 9, 0, 5), shape('slash'), 10, 0, 1);
+    expect(r.hit).toBe(true);
+    expect(r.ball.vx).toBeCloseTo(-5, 6);
+    expect(r.ball.vy).toBeCloseTo(0, 6);
+  });
+
+  it('a \\ turns it to the right', () => {
+    const r = collideShape(ball(100 + 9, 100 - 9, 0, 5), shape('backslash'), 10, 0, 1);
+    expect(r.ball.vx).toBeCloseTo(5, 6);
+    expect(r.ball.vy).toBeCloseTo(0, 6);
+  });
+
+  it('a bar pushes the ball out to touching distance and kicks it', () => {
+    // The + arm along y = 100, ball overlapping it from above (clear of the vertical arm).
+    const r = collideShape(ball(114, 91, 0, 5), shape('plus'), 10, 8, 1);
+    expect(r.ball.y).toBeCloseTo(100 - 4 - 10, 6);
+    expect(r.ball.vy).toBeCloseTo(-13, 6);
+    expect(r.impact).toBeCloseTo(5, 6);
+  });
+
+  it('a rhombus bounces a ball on its top corner straight back up', () => {
+    const r = collideShape(ball(100, 75, 0, 5), shape('diamond'), 10, 0, 1);
+    expect(r.ball.y).toBeCloseTo(70, 6);
+    expect(r.ball.vx).toBeCloseTo(0, 6);
+    expect(r.ball.vy).toBeCloseTo(-5, 6);
+  });
+
+  it('a rhombus sends a ball on its upper-right face off to the right', () => {
+    const r = collideShape(ball(115, 85, 0, 5), shape('diamond'), 10, 0, 1);
+    expect(r.ball.vx).toBeGreaterThan(0);
+  });
+
+  it('a wall bounces with the table bounciness and no kick', () => {
+    const r = collideShape(ball(100, 72, 0, 6), shape('wall'), 10, 0, 0.5);
+    expect(r.ball.y).toBeCloseTo(70, 6);
+    expect(r.ball.vy).toBeCloseTo(-3, 6);
+  });
+
+  it('a ball that got inside a wall is pushed out through the nearest face', () => {
+    const r = collideShape(ball(100, 84, 0, 6), shape('wall'), 10, 0, 1);
+    expect(r.ball.y).toBeCloseTo(70, 6);
+    expect(r.ball.vy).toBeCloseTo(-6, 6);
+  });
+
+  it('a wall corner pushes out diagonally', () => {
+    const r = collideShape(ball(125, 75, -1, 1), shape('wall'), 10, 0, 1);
+    expect(r.hit).toBe(true);
+    expect(r.ball.x).toBeGreaterThan(120);
+    expect(r.ball.y).toBeLessThan(80);
+    expect(Math.hypot(r.ball.x - 120, r.ball.y - 80)).toBeCloseTo(10, 6);
+  });
+
+  it('only separates a ball already moving away', () => {
+    const r = collideShape(ball(100, 72, 0, -6), shape('wall'), 10, 8, 1);
+    expect(r.ball.vy).toBe(-6);
+    expect(r.impact).toBe(0);
+  });
+
+  it('never returns NaN for a ball exactly on a bar', () => {
+    const r = collideShape(ball(100, 100, 0, 0), shape('plus'), 10, 8, 1);
+    expect([r.ball.x, r.ball.y, r.ball.vx, r.ball.vy].every(Number.isFinite)).toBe(true);
+  });
+});
+
+describe('layout persistence of shaped parts', () => {
+  it('round-trips every part type', () => {
+    const items: Part[] = PART_TYPES.map((type, i) => ({
+      id: `p${i}`,
+      type,
+      x: 0.5,
+      y: 1 + i * 0.2,
+      r: type === 'wall' ? 0.0625 : 0.05,
+      power: 1,
+    }));
+    const json = JSON.stringify(serializeLayout(items, 4, 8));
+    expect(parseLayout(JSON.parse(json), 4)).toEqual({ valid: true, items });
+  });
+
+  it('lets walls fill neighbouring cells, so they join into longer walls', () => {
+    const c = cellCenter(3, 10, 8);
+    const wall: Part = { id: 'w', type: 'wall', x: c.x, y: c.y, r: 0.0625, power: 1 };
+    expect(canPlace(4, 10, [wall], 8, 4, 0.4, 0.0625)).toBe(true);
+    expect(canPlace(3, 10, [wall], 8, 4, 0.4, 0.0625)).toBe(false);
   });
 });
