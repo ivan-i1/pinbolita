@@ -98,15 +98,12 @@ const DEFAULTS = {
   bounceVolume: 1.0,
   hitVolume: 1.0,
   debugBands: false, // tint the top/middle/bottom touch bands red/green/blue
-  // Renderer spike (ADV-REV Q9 / dark area D1): measure the frame rate, and load the table
-  // with static bumper-sized views to see what the RN-View renderer can carry.
+  // Renderer spike (ADV-REV Q9 / dark area D1): measure the frame rate.
   showFps: false,
-  stressViews: 0,
 };
 
 // Choice rows rather than sliders: these only make sense at these exact values.
 const LANE_COUNT_CHOICES = [1, 2, 3, 4];
-const STRESS_CHOICES = [0, 25, 50, 100];
 
 // Every slider is divided into four, so each has step = (max - min) / 4 and the defaults
 // above sit exactly on a stop.
@@ -125,7 +122,6 @@ const quarterStep = (k: keyof typeof SLIDERS) => (SLIDERS[k].max - SLIDERS[k].mi
 const SETTING_RANGES = {
   ...SLIDERS,
   laneCount: { min: 1, max: 4 },
-  stressViews: { min: 0, max: 100 },
 };
 const SETTINGS_STORAGE_KEY = '@pinbolita:settings';
 
@@ -148,7 +144,6 @@ const DEBUG_KEYS = [
   'friction',
   'debugBands',
   'showFps',
-  'stressViews',
 ] as const;
 
 // Bounces below this impact speed don't fire feedback — keeps the ball quiet when it's resting against a wall.
@@ -250,6 +245,7 @@ const RATE_HARD_MAX = 3.0;
 // Ball colour. The hue only moves when colourOnBounce is on; the default pink is the
 // seed so the first random hue is already visibly away from it.
 const BALL_DEFAULT_COLOR = '#ff4081';
+const TABLE_COLOR = '#2a2a2a';
 const HUE_MIN_SEPARATION = 60;
 
 // Swipe-down control bar. The playfield is otherwise bare, so a permanently visible
@@ -456,10 +452,9 @@ const publish = (entities: any, now: number, here: { k: number; inBand: boolean 
   entities.arrow.visible = arrow.visible;
   entities.arrow.length = arrow.length;
   entities.arrow.angle = arrow.angle;
-  for (const key of ['guides', 'stress', 'lanes', 'box', 'arrow', 'bumpers', 'grid']) {
+  for (const key of ['guides', 'lanes', 'box', 'arrow', 'bumpers', 'grid']) {
     entities[key].camY = camera.y;
   }
-  entities.stress.count = settings.stressViews;
   entities.hud.fps = settings.showFps ? 1000 / frameMsAvg : 0;
   box.color = settings.colorOnBounce ? ballColor : BALL_DEFAULT_COLOR;
   // Creative edits the layout with no ball; Test and Game play whatever is active.
@@ -656,39 +651,6 @@ const TableGuides = ({ camY }: { camY: number }) => (
   </View>
 );
 
-// Renderer spike (dark area D1): `count` static bumper-sized views spread over the table,
-// re-rendered every frame like real bumpers would be. They do not collide.
-const STRESS_SIZE = 0.12 * SCREEN_WIDTH;
-const StressViews = ({ count, camY }: { count: number; camY: number }) => {
-  if (!count) return null;
-  const usable = CATCH_EDGE_Y - STRESS_SIZE * 2;
-  return (
-    <View style={StyleSheet.absoluteFill} pointerEvents="none">
-      {Array.from({ length: count }, (_, i) => {
-        // Golden-ratio scatter: deterministic and evenly spread down the table.
-        const fx = (i * 0.6180339887) % 1;
-        const x = STRESS_SIZE / 2 + fx * (SCREEN_WIDTH - STRESS_SIZE);
-        const y = STRESS_SIZE + ((i + 0.5) / count) * usable;
-        return (
-          <View
-            key={i}
-            style={[
-              styles.stressView,
-              {
-                left: x - STRESS_SIZE / 2,
-                top: toScreenY(y, camY ?? 0) - STRESS_SIZE / 2,
-                width: STRESS_SIZE,
-                height: STRESS_SIZE,
-                borderRadius: STRESS_SIZE / 2,
-              },
-            ]}
-          />
-        );
-      })}
-    </View>
-  );
-};
-
 // The launch preview: a shaft from the ball's centre along the shot, with a head at the
 // tip. Its length is the launch speed, so it stops growing at the cap.
 const HEAD_HALF = 7; // half the arrowhead square's side
@@ -847,11 +809,10 @@ const Hud = ({ fps }: { fps: number }) =>
 
 // Built once, deliberately. GameEngine reads entities only at mount, and the root touch
 // responder needs a stable handle on the ball to work out which way "away from the tap"
-// is. Draw order follows key order: guides and stress views at the back, then the lanes,
+// is. Draw order follows key order: guides at the back, then the lanes,
 // the bumpers, the build grid, the ball, the arrow, and the HUD on top.
 const gameEntities = {
   guides: { camY: 0, renderer: <TableGuides camY={0} /> },
-  stress: { count: 0, camY: 0, renderer: <StressViews count={0} camY={0} /> },
   lanes: {
     visuals: lanes.map((lane) => laneVisual(lane, 0, 0, false)),
     camY: 0,
@@ -1158,12 +1119,6 @@ const DebugMenu = ({
             <Text style={styles.rowLabel}>Show FPS</Text>
             <Switch value={state.showFps} onValueChange={(v) => onChange('showFps', v)} />
           </View>
-          <ChoiceRow
-            label="Stress views (bumper-sized, no collision)"
-            choices={STRESS_CHOICES}
-            value={state.stressViews}
-            onPick={(v) => onChange('stressViews', v)}
-          />
         </ScrollView>
 
         <View style={styles.modalActions}>
@@ -1666,7 +1621,6 @@ export default function App() {
         if (!raw) return;
         const merged = mergeSettings(DEFAULTS, JSON.parse(raw), SETTING_RANGES);
         merged.laneCount = Math.round(merged.laneCount);
-        if (!STRESS_CHOICES.includes(merged.stressViews)) merged.stressViews = 0;
         Object.assign(settings, merged);
         setState({ ...merged });
         lanes = freshLanes();
@@ -2039,9 +1993,10 @@ export default function App() {
 }
 
 const styles = StyleSheet.create({
+  // The table itself: plain dark grey, unless the table carries its own background.
   container: {
     flex: 1,
-    backgroundColor: '#121212',
+    backgroundColor: TABLE_COLOR,
   },
   gameContainer: {
     flex: 1,
@@ -2185,7 +2140,7 @@ const styles = StyleSheet.create({
     left: 0,
     right: 0,
     height: TOP_INSET,
-    backgroundColor: '#121212',
+    backgroundColor: TABLE_COLOR,
   },
   guide: {
     position: 'absolute',
@@ -2197,12 +2152,6 @@ const styles = StyleSheet.create({
   guideTop: {
     height: 2,
     backgroundColor: 'rgba(255,255,255,0.18)',
-  },
-  stressView: {
-    position: 'absolute',
-    backgroundColor: 'rgba(120,160,255,0.35)',
-    borderWidth: 2,
-    borderColor: 'rgba(120,160,255,0.8)',
   },
   hud: {
     position: 'absolute',
