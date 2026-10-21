@@ -215,8 +215,12 @@ const LAYOUT_STORAGE_KEY = '@pinbolita:layout';
 // pieces no longer than half the ball's radius, at most MAX_SUBSTEPS per frame.
 const MAX_SUBSTEP = RADIUS * 0.5;
 const MAX_SUBSTEPS = 8;
-// The Creative tool strip down the right edge, where its buttons own every touch.
+// The Creative tool strip down the right edge, where its buttons own every touch. While
+// building it is put away, so all eight columns are reachable, and a bar along the bottom
+// (above Android's gesture strip) holds the part and Done.
 const STRIP_WIDTH = 76;
+const BUILD_BAR_HEIGHT = 56;
+const BUILD_BAR_BOTTOM = 52;
 const BUMPER_FLASH_MS = 120;
 
 // Camera: the view is the screen below the status bar, scrolling down the table. The
@@ -948,6 +952,9 @@ let partPower = 1;
 let partType: PartType = 'bumper';
 const halfSizeOf = (type: PartType) => (type === 'wall' ? WALL_HALF_TW : BUMPER_RADIUS_TW);
 const edit = { startCamera: 0, scrolling: false };
+// Creative has two states. Off, the tool strip is up and a drag only scrolls. On (Build),
+// the strip is away, every cell is reachable, and a tap places or removes a part.
+let building = false;
 let layoutSaveTimer: ReturnType<typeof setTimeout> | null = null;
 
 const saveLayout = () => {
@@ -980,7 +987,7 @@ const aimGhost = (pageX: number, pageY: number) => {
 const beginEdit = (pageX: number, pageY: number) => {
   edit.startCamera = camera.y;
   edit.scrolling = false;
-  aimGhost(pageX, pageY);
+  if (building) aimGhost(pageX, pageY);
 };
 
 const moveEdit = (dy: number) => {
@@ -993,7 +1000,7 @@ const moveEdit = (dy: number) => {
 const endEdit = () => {
   const { col, row, kind, visible } = ghost;
   ghost.visible = false;
-  if (edit.scrolling || !visible) return;
+  if (!building || edit.scrolling || !visible) return;
   if (kind === 'remove') {
     const target = bumperAt(col, row);
     layout = layout.filter((b) => b !== target);
@@ -1430,6 +1437,7 @@ export default function App() {
   const [partsOpen, setPartsOpen] = useState(false);
   const [power, setPower] = useState(partPower);
   const [kind, setKind] = useState<PartType>(partType);
+  const [buildingUi, setBuildingUi] = useState(false);
   const [bumperCount, setBumperCount] = useState(0);
   const go = (next: Mode) => {
     mode = next;
@@ -1481,8 +1489,11 @@ export default function App() {
         // play bands do not apply while editing.
         if (mode === 'creative') {
           band.current = 'none';
-          if (evt.nativeEvent.pageX > SCREEN_WIDTH - STRIP_WIDTH) return false;
-          beginEdit(evt.nativeEvent.pageX, evt.nativeEvent.pageY);
+          const { pageX, pageY } = evt.nativeEvent;
+          // The strip's buttons, or while building the bottom bar's, take their own taps.
+          if (!building && pageX > SCREEN_WIDTH - STRIP_WIDTH) return false;
+          if (building && pageY > SCREEN_HEIGHT - BUILD_BAR_BOTTOM - BUILD_BAR_HEIGHT) return false;
+          beginEdit(pageX, pageY);
           return true;
         }
         band.current = bandOf(
@@ -1656,7 +1667,14 @@ export default function App() {
   };
 
   // Creative: no ball; the layout under a build grid, scrolled by hand from the top.
+  const setBuild = (on: boolean) => {
+    building = on;
+    ghost.visible = false;
+    setBuildingUi(on);
+  };
+
   const enterCreative = () => {
+    setBuild(false);
     resetTable();
     setActiveParts([]);
     respawnPan = null;
@@ -2044,27 +2062,44 @@ export default function App() {
             <Text style={styles.creativeBadge} pointerEvents="none">
               CREATIVE · {bumperCount}
             </Text>
-            {/* The right-side tool strip (ADV-REV Q3, Q23): Parts, Debug, Test, plus Menu. */}
-            <View style={styles.strip}>
-              <TouchableOpacity style={styles.stripPart} onPress={() => setPartsOpen(true)}>
-                <PartGlyph type={kind} h={14} power={kind === 'wall' ? 1 : power} />
-                <Text style={styles.stripPartText}>
-                  {kind === 'wall' ? 'Wall' : `×${power}`}
-                </Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={styles.stripButton} onPress={() => setPartsOpen(true)}>
-                <Text style={styles.stripButtonText}>Parts</Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={styles.stripButton} onPress={() => setDebugOpen(true)}>
-                <Text style={styles.stripButtonText}>Debug</Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={styles.stripButton} onPress={startTest}>
-                <Text style={styles.stripButtonText}>Test</Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={styles.stripButton} onPress={backToMenu}>
-                <Text style={styles.stripButtonText}>Menu</Text>
-              </TouchableOpacity>
-            </View>
+            {buildingUi ? (
+              // Building: the whole width is the grid. This bar is the way back out.
+              <View style={styles.buildBar}>
+                <TouchableOpacity style={styles.buildBarPart} onPress={() => setPartsOpen(true)}>
+                  <PartGlyph type={kind} h={12} power={kind === 'wall' ? 1 : power} />
+                  <Text style={styles.stripPartText}>{kind === 'wall' ? 'Wall' : `×${power}`}</Text>
+                </TouchableOpacity>
+                <Text style={styles.buildBarHint}>Tap to place · tap a part to remove · drag to scroll</Text>
+                <TouchableOpacity style={[styles.button, styles.buildBarDone]} onPress={() => setBuild(false)}>
+                  <Text style={styles.buttonText}>Done</Text>
+                </TouchableOpacity>
+              </View>
+            ) : (
+              // The right-side tool strip (ADV-REV Q3, Q23). Build hides it for placing.
+              <View style={styles.strip}>
+                <TouchableOpacity style={styles.stripPart} onPress={() => setPartsOpen(true)}>
+                  <PartGlyph type={kind} h={14} power={kind === 'wall' ? 1 : power} />
+                  <Text style={styles.stripPartText}>
+                    {kind === 'wall' ? 'Wall' : `×${power}`}
+                  </Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.stripButton, styles.stripPrimary]}
+                  onPress={() => setBuild(true)}
+                >
+                  <Text style={[styles.stripButtonText, styles.stripPrimaryText]}>Build</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={styles.stripButton} onPress={startTest}>
+                  <Text style={styles.stripButtonText}>Test</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={styles.stripButton} onPress={() => setDebugOpen(true)}>
+                  <Text style={styles.stripButtonText}>Debug</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={styles.stripButton} onPress={backToMenu}>
+                  <Text style={styles.stripButtonText}>Menu</Text>
+                </TouchableOpacity>
+              </View>
+            )}
           </>
         )}
       </GameEngine>
@@ -2227,6 +2262,39 @@ const styles = StyleSheet.create({
     color: '#03dac6',
     fontSize: 13,
     fontWeight: 'bold',
+  },
+  stripPrimary: {
+    backgroundColor: '#03dac6',
+  },
+  stripPrimaryText: {
+    color: 'black',
+  },
+  buildBar: {
+    position: 'absolute',
+    left: 8,
+    right: 8,
+    bottom: BUILD_BAR_BOTTOM,
+    height: BUILD_BAR_HEIGHT,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    paddingHorizontal: 8,
+    borderRadius: 16,
+    backgroundColor: 'rgba(24,24,24,0.94)',
+    borderWidth: 1,
+    borderColor: '#03dac6',
+  },
+  buildBarPart: {
+    alignItems: 'center',
+    minWidth: 40,
+  },
+  buildBarHint: {
+    flex: 1,
+    color: '#bbb',
+    fontSize: 11,
+  },
+  buildBarDone: {
+    paddingHorizontal: 22,
   },
   stripPart: {
     alignItems: 'center',
