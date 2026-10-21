@@ -3,6 +3,7 @@ import {
   Alert,
   Animated,
   Dimensions,
+  Image,
   ImageBackground,
   Modal,
   PanResponder,
@@ -40,6 +41,10 @@ import {
   saveTable,
   serializeTables,
   type SavedTable,
+  type Background,
+  parseBackground,
+  tileHeight,
+  visibleTiles,
   parseLayout,
   serializeLayout,
   substepCount,
@@ -483,13 +488,15 @@ const publish = (entities: any, now: number, here: { k: number; inBand: boolean 
   entities.arrow.visible = arrow.visible;
   entities.arrow.length = arrow.length;
   entities.arrow.angle = arrow.angle;
-  for (const key of ['guides', 'lanes', 'box', 'arrow', 'bumpers', 'grid']) {
+  for (const key of ['backdrop', 'guides', 'lanes', 'box', 'arrow', 'bumpers', 'grid']) {
     entities[key].camY = camera.y;
   }
   entities.hud.fps = settings.showFps ? 1000 / frameMsAvg : 0;
   box.color = settings.colorOnBounce ? ballColor : BALL_DEFAULT_COLOR;
   // Creative edits the layout with no ball; Test and Game play whatever is active.
   const editing = mode === 'creative';
+  entities.backdrop.bg =
+    mode === 'creative' || mode === 'test' ? draftBackground : mode === 'game' ? activeBackground : null;
   box.hidden = editing;
   entities.bumpers.items = editing ? layout : activeBumpers;
   entities.bumpers.hits = bumperHits;
@@ -667,6 +674,35 @@ const LaneStrip = ({ visuals, camY }: { visuals: LaneVisual[]; camY: number }) =
     ))}
   </View>
 );
+
+// The table's own picture, when it has one: fitted to the table's width and repeated down
+// it. Only the tiles in view are drawn; resizeMethod="resize" has Android decode each at
+// the size it is shown, not at the photo's full resolution.
+const MIN_TILE_HEIGHT = 24;
+const TableBackdrop = ({ bg, camY }: { bg: Background | null; camY: number }) => {
+  if (!bg) return null;
+  const tileH = tileHeight(SCREEN_WIDTH, bg, MIN_TILE_HEIGHT);
+  const cam = camY ?? 0;
+  return (
+    <View style={StyleSheet.absoluteFill} pointerEvents="none">
+      {visibleTiles(cam, VIEWPORT_HEIGHT, tileH, WORLD_HEIGHT).map((i) => (
+        <Image
+          key={i}
+          source={{ uri: bg.uri }}
+          resizeMode="stretch"
+          resizeMethod="resize"
+          style={{
+            position: 'absolute',
+            left: 0,
+            top: toScreenY(i * tileH, cam),
+            width: SCREEN_WIDTH,
+            height: tileH,
+          }}
+        />
+      ))}
+    </View>
+  );
+};
 
 // Faint lines across the table every table-width, plus its top edge, so that scrolling
 // down an otherwise empty table is visible at all.
@@ -913,6 +949,7 @@ const Hud = ({ fps }: { fps: number }) =>
 // is. Draw order follows key order: guides at the back, then the lanes,
 // the bumpers, the build grid, the ball, the arrow, and the HUD on top.
 const gameEntities = {
+  backdrop: { bg: null as Background | null, camY: 0, renderer: <TableBackdrop bg={null} camY={0} /> },
   guides: { camY: 0, renderer: <TableGuides camY={0} /> },
   lanes: {
     visuals: lanes.map((lane) => laneVisual(lane, 0, 0, false)),
@@ -975,8 +1012,40 @@ const persistTables = () =>
     TABLES_STORAGE_KEY,
     JSON.stringify(serializeTables(tables, TABLE_ASPECT, GRID_CELLS)),
   ).catch(() => {});
+// The picture under the table being edited, and under the table being played in Game.
+// Each is a file of its own in the app's documents: a saved table owns a copy, so deleting
+// or replacing one never pulls the picture out from under another.
+let draftBackground: Background | null = null;
+let activeBackground: Background | null = null;
+
 const persistDraftMeta = () =>
-  AsyncStorage.setItem(DRAFT_META_STORAGE_KEY, JSON.stringify({ name: draftName })).catch(() => {});
+  AsyncStorage.setItem(
+    DRAFT_META_STORAGE_KEY,
+    JSON.stringify({ name: draftName, background: draftBackground }),
+  ).catch(() => {});
+
+const extensionOf = (name: string) => {
+  const m = /\.([a-z0-9]{2,5})$/i.exec(name);
+  return m ? `.${m[1].toLowerCase()}` : '.jpg';
+};
+// Copies get a fresh name every time: the image cache keys on the uri, so overwriting a
+// file in place would keep showing the old picture.
+const copyImage = (fromUri: string, prefix: string, ext: string): string => {
+  const dest = new File(Paths.document, `${prefix}-${Date.now().toString(36)}${ext}`);
+  new File(fromUri).copy(dest);
+  return dest.uri;
+};
+const deleteImage = (bg: Background | null) => {
+  if (!bg) return;
+  try {
+    const f = new File(bg.uri);
+    if (f.exists) f.delete();
+  } catch {}
+};
+const imageSize = (uri: string) =>
+  new Promise<{ w: number; h: number }>((resolve, reject) =>
+    Image.getSize(uri, (w, h) => resolve({ w, h }), reject),
+  );
 const newTableId = () => `t${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`;
 
 const saveLayout = () => {
@@ -1826,6 +1895,7 @@ export default function App() {
     setPickerOpen(false);
     resetTable();
     setActiveParts(table ? [...table.items] : []);
+    activeBackground = table?.background ?? null;
     respawnPan = null;
     camera.y = 0;
     hideBar();
@@ -1913,7 +1983,20 @@ export default function App() {
   };
 
   const commitSave = (name: string) => {
-    const result = saveTable(tables, { name, items: [...layout], background: null }, Date.now(), newTableId);
+    // The table keeps its own copy of the picture; its old copy, if any, goes.
+    const existing = tables.find((t) => t.name.toLowerCase() === name.toLowerCase());
+    const id = existing?.id ?? newTableId();
+    let background: Background | null = null;
+    try {
+      if (draftBackground) {
+        const uri = copyImage(draftBackground.uri, `bg-${id}`, extensionOf(draftBackground.uri));
+        background = { uri, w: draftBackground.w, h: draftBackground.h };
+      }
+    } catch {
+      Alert.alert('Background not saved', 'The picture could not be copied; the table was saved without it.');
+    }
+    if (existing?.background && existing.background.uri !== background?.uri) deleteImage(existing.background);
+    const result = saveTable(tables, { name, items: [...layout], background }, Date.now(), () => id);
     tables = result.tables;
     setTableList(tables);
     persistTables();
@@ -1944,6 +2027,14 @@ export default function App() {
       layout = [...t.items];
       setBumperCount(layout.length);
       saveLayout();
+      deleteImage(draftBackground);
+      draftBackground = null;
+      try {
+        if (t.background) {
+          const uri = copyImage(t.background.uri, 'bg-draft', extensionOf(t.background.uri));
+          draftBackground = { uri, w: t.background.w, h: t.background.h };
+        }
+      } catch {}
       setDraftName(t.name);
       setTablesOpen(false);
     };
@@ -1964,12 +2055,49 @@ export default function App() {
         text: 'Delete',
         style: 'destructive',
         onPress: () => {
+          deleteImage(t.background);
           tables = deleteTable(tables, t.id);
           setTableList(tables);
           persistTables();
         },
       },
     ]);
+
+  // A picture under the table being edited. It is copied into the app's documents, so the
+  // original can be moved or deleted; it is drawn fitted to the width and repeated down.
+  const pickBackground = async () => {
+    const result = await DocumentPicker.getDocumentAsync({ type: 'image/*', copyToCacheDirectory: true });
+    if (result.canceled) return;
+    const asset = result.assets[0];
+    try {
+      const uri = copyImage(asset.uri, 'bg-draft', extensionOf(asset.name));
+      const size = await imageSize(uri);
+      const next = parseBackground({ uri, w: size.w, h: size.h });
+      if (!next) throw new Error('unreadable image');
+      deleteImage(draftBackground);
+      draftBackground = next;
+      persistDraftMeta();
+    } catch {
+      Alert.alert('Could not use that image', 'Pick a PNG, JPEG or WebP picture.');
+    }
+  };
+
+  const clearBackground = () => {
+    deleteImage(draftBackground);
+    draftBackground = null;
+    persistDraftMeta();
+  };
+
+  const chooseBackground = () =>
+    Alert.alert(
+      'Table background',
+      'Your picture is fitted to the table width and repeated down the table. Save the table to keep it with the table.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        ...(draftBackground ? [{ text: 'Plain', onPress: clearBackground }] : []),
+        { text: 'Upload…', onPress: () => void pickBackground() },
+      ],
+    );
 
   const newDraft = () =>
     Alert.alert('Start a new table?', 'The table you are editing is cleared. Save it first if you want to keep it.', [
@@ -1981,6 +2109,8 @@ export default function App() {
           layout = [];
           setBumperCount(0);
           saveLayout();
+          deleteImage(draftBackground);
+          draftBackground = null;
           setDraftName(null);
           setTablesOpen(false);
         },
@@ -2051,6 +2181,9 @@ export default function App() {
         const name = typeof meta?.name === 'string' ? cleanTableName(meta.name) : null;
         draftName = name;
         setDraftNameUi(name);
+        // The OS may have reclaimed the copy; a picture that is gone is forgotten.
+        const bg = parseBackground(meta?.background);
+        draftBackground = bg && new File(bg.uri).exists ? bg : null;
       })
       .catch(() => {});
 
@@ -2360,6 +2493,9 @@ export default function App() {
                 </TouchableOpacity>
                 <TouchableOpacity style={styles.stripButton} onPress={() => setTablesOpen(true)}>
                   <Text style={styles.stripButtonText}>Tables</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={styles.stripButton} onPress={chooseBackground}>
+                  <Text style={styles.stripButtonText}>Image</Text>
                 </TouchableOpacity>
                 <TouchableOpacity style={styles.stripButton} onPress={startTest}>
                   <Text style={styles.stripButtonText}>Test</Text>
